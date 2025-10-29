@@ -18,7 +18,7 @@ count(constituencywise_results.parliament_constituency)
 from constituencywise_results
 inner join statewise_results1 on constituencywise_results.parliament_constituency=statewise_results1.parliament_constituency
 inner join states on states.state_id=statewise_results1.state_id
-group by states.state
+groupÂ byÂ states.state
 
 --Total seats won by NDA Alliance
 Select
