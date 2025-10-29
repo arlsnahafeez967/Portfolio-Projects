@@ -1,0 +1,3704 @@
+drop table if exists bdl_finance.be_soa_bangl_history_subset;
+create table bdl_finance.be_soa_bangl_history_subset as
+WITH latest_bill_cycles_col AS (
+SELECT
+  REPLACE(
+    CASE
+      WHEN day(current_date()) < 10 THEN
+        CAST(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)) AS STRING)
+      WHEN day(current_date()) < 20 THEN
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 9) AS STRING)
+      ELSE
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 19) AS STRING)
+    END, '-', ''
+  ) AS cycle_1),
+
+BillCycle_PMRC as(
+	     select    bill_cycle_type,
+	     expected_disc,
+			effective_time,
+		    billed_date ,
+		    invoice_id,
+		    invoice_detail_id,
+		    account_id,
+		    iban,
+		    bill_cycle,
+            descrip,
+		    item_name,
+		    created,
+			end_dt,
+		    product_name,
+            NVL(net_amount,0) AS net_amount,
+		    load_date,
+			rnk 
+			from (
+			SELECT
+			bc.bill_cycle_type,
+			bc.effective_time,
+			b.discount as expected_disc,
+			b.created,
+			b.end_dt,
+		    bangl.billed_date ,
+		    bangl.invoice_id,
+		    bangl.invoice_detail_id,
+		    bangl.account_id,
+		    bangl.iban,
+		    bangl.bill_cycle,
+            bangl.descrip,
+		    bangl.item_name,
+		    bangl.product_name,
+            bangl.net_amount,
+		    bangl.load_date,
+			DENSE_RANK() OVER (PARTITION BY bc.account_id ORDER BY bc.expiration_time DESC) AS rnk
+		from bdl_finance.be_soa_bangl_history AS bangl
+		left JOIN 
+			bdl_raw.cbs_bc_acct_bill_cycle AS bc 
+			ON bangl.account_id = bc.account_id
+			inner join bdl_finance.be_history_record b
+			on b.ban=bangl.iban
+		
+		WHERE bangl.net_amount<0
+		and (name ILIKE '%Shared Child Plan%' or name ilike '%waiver%' or name ILIKE '%month%' or name ilike 'stc Business One Extension' )
+		and (descrip ILIKE '%Shared Child Dis%'or descrip ILIKE 'Plan change - Advance MRC Discount' or descrip ILIKE 'Plan change waiver' or descrip ILIKE '%waiver%' or descrip ilike '%	stc Business DIS Extension Offer%')
+		and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+		and bc.bill_cycle_type in ('1','10','20')
+		AND 
+		    bc.effective_time < (cast(trunc(add_months(now(), - 0), 'MONTH') AS DATE))
+		AND
+            bc.expiration_time > NOW()
+        AND bill_cycle in (select * from  latest_bill_cycles_col)
+            )a
+            ),
+CRM_PMRC_billcycle_1 as
+(
+      select    bill_cycle_type,
+			effective_time,
+			expected_disc,
+		    billed_date ,
+		    invoice_id,
+		    invoice_detail_id,
+		    account_id,
+		    iban,
+		    bill_cycle,
+            descrip,
+            created,
+			end_dt,
+		    item_name,
+		    product_name,
+            NVL(net_amount,0) AS net_amount,
+		    load_date,
+        Dense_rank() OVER (PARTITION BY iban ORDER BY bill_cycle DESC) AS rnk
+    FROM 
+        BillCycle_PMRC
+),
+CRM_PMRC_billcycle_2 as
+(
+    SELECT * FROM CRM_PMRC_billcycle_1
+    WHERE rnk=1
+)
+
+,
+CRM_PMRC_billcycle_3 as
+(
+    SELECT * FROM CRM_PMRC_billcycle_1
+    WHERE rnk=2
+),
+BillCycle_ids AS 
+(
+    SELECT * FROM BillCycle_PMRC
+    WHERE 
+    bill_cycle_type in ('1','10','20') 
+    AND 
+    rnk = 1
+),
+All_PMRC_billcyc as
+(
+select a.iban,
+a.billed_date,
+a.bill_cycle,
+b.bill_cycle_type,
+CASE 
+WHEN b.bill_cycle_type = '1'
+THEN  ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 0) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+--
+WHEN b.bill_cycle_type = '10' AND DAY(CURRENT_DATE()) <= 10 
+THEN ROUND((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -2), 'MONTH'), 9) AS DATE), 
+       CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE))) + 0)
+/ (DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+
+WHEN b.bill_cycle_type = '10' AND DAY(CURRENT_DATE()) > 10 
+THEN ROUND((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 9) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE))) + 0)
+/ (DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+--
+WHEN b.bill_cycle_type ='20' AND DAY(CURRENT_DATE()) <= 20 
+THEN ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -2), 'MONTH'), 19) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+
+WHEN b.bill_cycle_type ='20' AND DAY(CURRENT_DATE()) > 20 
+THEN ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 19) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+END AS expected_disc,
+a.net_amount,
+a.invoice_id,
+a.invoice_detail_id,
+a.account_id,
+a.descrip,
+a.item_name,
+a.product_name,
+a.load_date,
+a.created,
+a.end_dt
+FROM 
+    CRM_PMRC_billcycle_3 a
+INNER JOIN
+     BillCycle_ids b
+ON
+    a.iban=b.iban
+),
+adv_pro_bans as
+(SELECT 
+    distinct a.bill_cycle as pro_bill_cycle,a.iban as pro_iban--,net_amount as discnt,expected_disc,
+    /*case when net_amount=expected_disc then 'Matched'
+    else 'Unmatched' end as reconciled*/--created,end_dt,bill_cycle,expected_disc,net_amount,invoice_id,invoice_detail_id, account_id,descrip,item_name,product_name,load_date,bill_cycle_type
+FROM 
+    All_PMRC_billcyc a
+   left join latest_bill_cycles_col cyc 
+on
+cast(to_date(end_dt) as date format 'yyyy-mm-dd') > cast (cyc.cycle_1 AS DATE FORMAT 'yyyymmdd')
+OR end_dt IS NULL  
+     where cast(to_date(created) as date format 'yyyy-mm-dd') <  ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(cyc.cycle_1, 1, 4), '-', SUBSTR(cyc.cycle_1, 5, 2), '-', SUBSTR(cyc.cycle_1, 7, 2)) AS DATE),
+            1
+        )
+    ),
+    
+    
+	
+first_active_bans as
+(
+select distinct soa.iban from bdl_finance.be_soa_bangl_history soa
+inner join
+(select iban,bill_cycle,lag(bill_cycle) over (partition by iban order by billed_date) as lag_cycle from
+        (select distinct iban,bill_cycle,billed_date from bdl_finance.be_soa_bangl_history)a
+	)b 
+	on soa.iban = b.iban and soa.bill_cycle = b.bill_cycle
+	where b.lag_cycle is NULL
+	and soa.bill_cycle = (select cycle_1 from latest_bill_cycles_col)
+   and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+    and net_amount < 0
+)
+
+ select CAST(
+        DATE_ADD(
+            CAST(CONCAT(SUBSTR(bill_cycle, 1, 4), '-', SUBSTR(bill_cycle, 5, 2), '-', SUBSTR(bill_cycle, 7, 2)) AS DATE),
+            INTERVAL 1 MONTH
+        ) AS String
+    ) AS billed_date,invoice_id,invoice_detail_id,account_id,iban,dban,cban,bill_no,bill_cycle,product_id,descrip,item_name,service,net_amount,product_name,payment_channel,payment_sub_channel,event,glid,load_date,individual_flag
+	from bdl_finance.be_soa_bangl_history b
+	left join
+	adv_pro_bans pro
+	on b.iban = pro.pro_iban and b.bill_cycle=pro.pro_bill_cycle
+	where pro.pro_iban is NULL
+	and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+    AND net_amount < 0
+	and b.bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+	and b.iban not in (select iban from first_active_bans);
+
+
+
+
+
+drop table if exists bdl_finance.be_temp_base2_subset;
+create table bdl_finance.be_temp_base2_subset as 
+WITH latest_bill_cycles_col AS (
+SELECT
+  REPLACE(
+    CASE
+      WHEN day(current_date()) < 10 THEN
+        CAST(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)) AS STRING)
+      WHEN day(current_date()) < 20 THEN
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 9) AS STRING)
+      ELSE
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 19) AS STRING)
+    END, '-', ''
+  ) AS cycle_1),
+
+BillCycle_PMRC as(
+	     select    bill_cycle_type,
+	     expected_disc,
+			effective_time,
+		    billed_date ,
+		    invoice_id,
+		    invoice_detail_id,
+		    account_id,
+		    iban,
+		    bill_cycle,
+            descrip,
+		    item_name,
+		    created,
+			end_dt,
+		    product_name,
+            NVL(net_amount,0) AS net_amount,
+		    load_date,
+			rnk 
+			from (
+			SELECT
+			bc.bill_cycle_type,
+			bc.effective_time,
+			b.discount as expected_disc,
+			b.created,
+			b.end_dt,
+		    bangl.billed_date ,
+		    bangl.invoice_id,
+		    bangl.invoice_detail_id,
+		    bangl.account_id,
+		    bangl.iban,
+		    bangl.bill_cycle,
+            bangl.descrip,
+		    bangl.item_name,
+		    bangl.product_name,
+            bangl.net_amount,
+		    bangl.load_date,
+			DENSE_RANK() OVER (PARTITION BY bc.account_id ORDER BY bc.expiration_time DESC) AS rnk
+		from bdl_finance.be_soa_bangl_history AS bangl
+		left JOIN 
+			bdl_raw.cbs_bc_acct_bill_cycle AS bc 
+			ON bangl.account_id = bc.account_id
+			inner join bdl_finance.be_temp_base2 b
+			on b.ban=bangl.iban
+		
+		WHERE bangl.net_amount<0
+		and (name ILIKE '%Shared Child Plan%' or name ilike '%waiver%' or name ILIKE '%month%' or name ilike 'stc Business One Extension' )
+		and (descrip ILIKE '%Shared Child Dis%'or descrip ILIKE 'Plan change - Advance MRC Discount' or descrip ILIKE 'Plan change waiver' or descrip ILIKE '%waiver%' or descrip ilike '%	stc Business DIS Extension Offer%')
+		and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+		and bc.bill_cycle_type in ('1','10','20')
+		AND 
+		    bc.effective_time < (cast(trunc(add_months(now(), - 0), 'MONTH') AS DATE))
+		AND
+            bc.expiration_time > NOW()
+        AND bill_cycle in (select * from  latest_bill_cycles_col)
+            )a
+            ),
+CRM_PMRC_billcycle_1 as
+(
+      select    bill_cycle_type,
+			effective_time,
+			expected_disc,
+		    billed_date ,
+		    invoice_id,
+		    invoice_detail_id,
+		    account_id,
+		    iban,
+		    bill_cycle,
+            descrip,
+            created,
+			end_dt,
+		    item_name,
+		    product_name,
+            NVL(net_amount,0) AS net_amount,
+		    load_date,
+        Dense_rank() OVER (PARTITION BY iban ORDER BY bill_cycle DESC) AS rnk
+    FROM 
+        BillCycle_PMRC
+),
+CRM_PMRC_billcycle_2 as
+(
+    SELECT * FROM CRM_PMRC_billcycle_1
+    WHERE rnk=1
+)
+
+,
+CRM_PMRC_billcycle_3 as
+(
+    SELECT * FROM CRM_PMRC_billcycle_1
+    WHERE rnk=2
+),
+BillCycle_ids AS 
+(
+    SELECT * FROM BillCycle_PMRC
+    WHERE 
+    bill_cycle_type in ('1','10','20') 
+    AND 
+    rnk = 1
+),
+All_PMRC_billcyc as
+(
+select a.iban,
+a.billed_date,
+a.bill_cycle,
+b.bill_cycle_type,
+CASE 
+WHEN b.bill_cycle_type = '1'
+THEN  ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 0) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+--
+WHEN b.bill_cycle_type = '10' AND DAY(CURRENT_DATE()) <= 10 
+THEN ROUND((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -2), 'MONTH'), 9) AS DATE), 
+       CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE))) + 0)
+/ (DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+
+WHEN b.bill_cycle_type = '10' AND DAY(CURRENT_DATE()) > 10 
+THEN ROUND((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 9) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE))) + 0)
+/ (DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+--
+WHEN b.bill_cycle_type ='20' AND DAY(CURRENT_DATE()) <= 20 
+THEN ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -2), 'MONTH'), 19) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+
+WHEN b.bill_cycle_type ='20' AND DAY(CURRENT_DATE()) > 20 
+THEN ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 19) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+END AS expected_disc,
+a.net_amount,
+a.invoice_id,
+a.invoice_detail_id,
+a.account_id,
+a.descrip,
+a.item_name,
+a.product_name,
+a.load_date,
+a.created,
+a.end_dt
+FROM 
+    CRM_PMRC_billcycle_3 a
+INNER JOIN
+     BillCycle_ids b
+ON
+    a.iban=b.iban
+),
+adv_pro_bans as
+(SELECT 
+    distinct a.bill_cycle as pro_bill_cycle,a.iban as pro_iban--,net_amount as discnt,expected_disc,
+    /*case when net_amount=expected_disc then 'Matched'
+    else 'Unmatched' end as reconciled*/--created,end_dt,bill_cycle,expected_disc,net_amount,invoice_id,invoice_detail_id, account_id,descrip,item_name,product_name,load_date,bill_cycle_type
+FROM 
+    All_PMRC_billcyc a
+   left join latest_bill_cycles_col cyc 
+on
+cast(to_date(end_dt) as date format 'yyyy-mm-dd') > cast (cyc.cycle_1 AS DATE FORMAT 'yyyymmdd')
+OR end_dt IS NULL  
+     where cast(to_date(created) as date format 'yyyy-mm-dd') <  ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(cyc.cycle_1, 1, 4), '-', SUBSTR(cyc.cycle_1, 5, 2), '-', SUBSTR(cyc.cycle_1, 7, 2)) AS DATE),
+            1
+        )
+    ),
+    
+    
+	
+first_active_bans as
+(
+select distinct soa.iban from bdl_finance.be_soa_bangl_history soa
+inner join
+(select iban,bill_cycle,lag(bill_cycle) over (partition by iban order by billed_date) as lag_cycle from
+        (select distinct iban,bill_cycle,billed_date from bdl_finance.be_soa_bangl_history)a
+	)b 
+	on soa.iban = b.iban and soa.bill_cycle = b.bill_cycle
+	where b.lag_cycle is NULL
+	and soa.bill_cycle = (select cycle_1 from latest_bill_cycles_col)
+   and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+    and net_amount < 0
+),
+
+cutoff_date AS (
+    SELECT CAST(cycle_1 AS DATE FORMAT 'yyyymmdd') AS bill_dt 
+    FROM latest_bill_cycles_col
+),
+deleted_orders AS (
+    /*SELECT asset_integ_id 
+    FROM bdl_raw.crm_s_order_item_1 
+    WHERE action_cd ILIKE 'delete'
+    AND status_cd = 'Complete'
+	and created < (select cast (cyc.cycle_1 AS DATE FORMAT 'yyyymmdd') from latest_bill_cycles_col cyc)
+    GROUP BY 1*/
+
+    select distinct asset_integ_id from (
+    SELECT asset_integ_id 
+    FROM bdl_raw.crm_s_order_item_1 
+    WHERE action_cd ILIKE 'delete'
+    AND status_cd = 'Complete'
+    and created < (SELECT bill_dt FROM cutoff_date)
+    GROUP BY 1
+union
+    select integration_id
+    from bdl_raw.crm_s_asset, cutoff_date
+    where ((status_cd = 'Inactive' and status_chg_dt < bill_dt)--(select cast (cyc.cycle_1 AS DATE FORMAT 'yyyymmdd') from latest_bill_cycles_col cyc) /*Billed_dt*/)  
+            or (status_cd = 'Active' and  end_dt < bill_dt)--(select cast (cyc.cycle_1 AS DATE FORMAT 'yyyymmdd') from latest_bill_cycles_col cyc) /*Billed_dt*/ )
+            )
+    --and integration_id = '1-2YZ58Z3F'
+    )a 
+) ,
+iban_billCycle as (
+select distinct iban, bill_cycle as Cycle_1,CAST(
+        DATE_ADD(
+            CAST(CONCAT(SUBSTR(bill_cycle, 1, 4), '-', SUBSTR(bill_cycle, 5, 2), '-', SUBSTR(bill_cycle, 7, 2)) AS DATE), 
+            INTERVAL 1 MONTH
+        ) AS String
+    ) AS billed_date from  bdl_finance.be_soa_bangl_history
+where bill_cycle = (select cycle_1 from latest_bill_cycles_col)
+and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+    AND net_amount < 0
+),
+asset_check as ( 
+with asset_base as 
+ (
+ select * from( 
+ SELECT a.*, ROW_NUMBER() OVER (PARTITION BY a.ban,a.name,a.integration_id ORDER BY NVL(a.end_dt, a.status_chg_dt),discount,a.created) AS ident 
+        FROM bdl_finance.be_history_record a
+        left join iban_billCycle c
+        on a.ban = c.iban
+        where a.source='Asset'
+        and a.integration_id  not in (select asset_integ_id from deleted_orders)
+        and ((a.status_cd ='Active') or (a.status_cd='active')
+        or (a.status_cd ='Inactive' and CAST(TO_DATE(a.status_chg_dt) AS DATE) > cast(c.billed_date as date format 'yyyy-mm-dd') ))
+    )a where ident = 1    
+ ),
+ orderitem_base as (SELECT * FROM (
+        SELECT a.*, ROW_NUMBER() OVER (PARTITION BY a.ban, a.name, a.integration_id ORDER BY a.discount, a.created) AS ident 
+        FROM bdl_finance.be_history_record a
+        where source='Order Item'
+		and a.status_cd = 'Complete'
+		and a.action_cd in ('Add', '-', 'Update')
+        and a.integration_id not in (select asset_integ_id from deleted_orders)
+    ) a
+    WHERE ident = 1)
+
+
+select 
+nvl(aset.ban, io.ban) as ban,
+nvl(aset.source, io.source) as source,
+nvl(aset.san, io.san) as san,
+nvl(aset.created, io.created) as created,
+nvl(aset.end_dt, io.end_dt) as end_dt,
+nvl(aset.discount, io.discount) as discount,
+nvl(aset.net_pri, io.net_pri) as net_pri,
+nvl(aset.extd_qty, io.extd_qty) as extd_qty,
+nvl(aset.name, io.name) as name,
+nvl(aset.integration_id, io.integration_id) as integration_id,
+nvl(aset.orig_order_id, io.orig_order_id) as orig_order_id,
+nvl(aset.created_by, io.created_by) as created_by,
+nvl(aset.status_cd, io.status_cd) as status_cd,
+nvl(aset.action_cd, io.action_cd) as action_cd,
+nvl(aset.prod_id, io.prod_id) as prod_id,
+nvl(aset.status_chg_dt, io.status_chg_dt) as status_chg_dt,
+nvl(aset.serial_num, io.serial_num) as serial_num,
+nvl(aset.activation_date, io.activation_date) as activation_date,
+nvl(aset.last_updated, io.last_updated) as last_updated,
+nvl(aset.x_department, io.x_department) as x_department,
+nvl(aset.x_channel, io.x_channel) as x_channel,
+nvl(aset.activating_agent, io.activating_agent) as activating_agent,
+nvl(aset.activating_agent_deparmtent, io.activating_agent_deparmtent) as activating_agent_deparmtent,
+nvl(aset.billingaccountnumber, io.billingaccountnumber) as billingaccountnumber,
+nvl(aset.customer_ident, io.customer_ident) as customer_ident,
+nvl(aset.customeraccountnumber, io.customeraccountnumber) as customeraccountnumber,
+nvl(aset.customername, io.customername) as customername,
+nvl(aset.billingaccountname, io.billingaccountname) as billingaccountname,
+nvl(aset.nationality, io.nationality) as nationality,
+nvl(aset.customertype, io.customertype) as customertype,
+nvl(aset.occupation, io.occupation) as occupation,
+nvl(aset.line_ctgy, io.line_ctgy) as line_ctgy,
+nvl(aset.customersegment, io.customersegment) as customersegment,
+nvl(aset.desc_text, io.desc_text) as desc_text
+from asset_base aset
+full outer join 
+orderitem_base io
+on aset.integration_id = io.integration_id
+
+        )
+       select a.*, cyc.Cycle_1
+        FROM iban_billCycle cyc
+        left join asset_check a  
+        on a.ban = cyc.iban
+ where  case when end_dt IS not NULL then cast(to_date(end_dt) as date format 'yyyy-mm-dd') >cast (cyc.cycle_1 AS DATE FORMAT 'yyyymmdd')
+ when end_dt IS NULL then true
+ else false end 
+and a.created < cyc.billed_date
+    --AND discount IS NOT NULL
+	and ban  not in (select iban from first_active_bans)
+	AND integration_id NOT IN (SELECT asset_integ_id FROM deleted_orders);
+
+
+Drop table if exists bdl_finance.be_complete_discount_adv_norm1halfother;
+Create table bdl_finance.be_complete_discount_adv_norm1halfother as
+WITH latest_bill_cycles_col AS (
+SELECT
+  REPLACE(
+    CASE
+      WHEN day(current_date()) < 10 THEN
+        CAST(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)) AS STRING)
+      WHEN day(current_date()) < 20 THEN
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 9) AS STRING)
+      ELSE
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 19) AS STRING)
+    END, '-', ''
+  ) AS cycle_1),
+/*WITH latest_bill_cycles_col AS (
+select
+    '20250301' as cycle_1
+    ,
+    -- Include 10th of current month if today is >= 10, otherwise 10th of previous month
+    '20250210' as cycle_2
+    ,
+    -- Include 20th of current month if today is >= 20, otherwise 20th of previous month
+    '20250220' as cycle_3
+    ),*/
+
+first_active_bans as
+(
+select distinct soa.iban from bdl_finance.be_soa_bangl_history soa
+inner join
+(select iban,bill_cycle,lag(bill_cycle) over (partition by iban order by billed_date) as lag_cycle from
+        (select distinct iban,bill_cycle,billed_date from bdl_finance.be_soa_bangl_history)a
+	)b 
+	on soa.iban = b.iban and soa.bill_cycle = b.bill_cycle
+	where b.lag_cycle is NULL
+	and soa.bill_cycle = (select cycle_1 from latest_bill_cycles_col)
+ and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+    and net_amount < 0
+),
+
+Promo_discount_CTE_norm as
+(
+with cbs_data as
+(
+select * from bdl_finance.be_soa_bangl_history
+where item_name in ( 'Penalty Charges') 
+and product_name ilike '%stc Promocode Discount%'
+AND net_amount < 0
+and bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+and iban not in (select iban from first_active_bans)
+),
+
+crm_data as
+(
+select * from bdl_finance.be_temp_base2_subset  c
+ where CAST(TO_DATE(created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+ and c.name ILIKE '%stc Promocode Discount%'
+),
+
+crm_promo_agg as 
+(
+select ban, round(sum(discount),3) as discount from crm_data group by 1
+),
+
+cbs_promo_agg as 
+(
+select billed_date,iban, sum(net_amount) as net_amount from cbs_data group by 1,2
+)
+
+
+select b.iban ,b.billed_date,b.net_amount,c.discount,
+CASE 
+    WHEN b.net_amount = c.discount THEN 'Matched'
+    WHEN c.ban IS NULL THEN 'CRM data not available'
+    ELSE 'Unmatched'
+    end as reconciled
+    from cbs_promo_agg as b
+    left join  crm_promo_agg c
+    on b.iban = c.ban
+)
+
+
+
+
+
+
+,
+
+
+Device_discount_CTE_norm as
+(
+with cbs_data as
+(
+select * from bdl_finance.be_soa_bangl_history
+where item_name in ( 'Fee Deduction') 
+and product_name ilike '%Free Device Promo%'
+AND net_amount < 0
+and bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+and iban not in (select iban from first_active_bans)
+),
+
+crm_data as
+(
+select * from bdl_finance.be_temp_base2_subset  c
+ where CAST(TO_DATE(created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+ and c.name ILIKE '%Free Device Promo%'
+),
+
+crm_promo_agg as 
+(
+select ban, round(sum(discount),3) as discount from crm_data group by 1
+),
+
+cbs_promo_agg as 
+(
+select billed_date,iban, sum(net_amount) as net_amount from cbs_data group by 1,2
+)
+
+
+select b.iban ,b.billed_date,b.net_amount,c.discount,
+CASE 
+    WHEN b.net_amount = c.discount THEN 'Matched'
+    WHEN c.ban IS NULL THEN 'CRM data not available'
+    ELSE 'Unmatched'
+    end as reconciled
+    from cbs_promo_agg as b
+    left join  crm_promo_agg c
+    on b.iban = c.ban
+),
+
+ Community_disc_CTE_norm as
+(with offer_prop as
+(
+select 
+prop.owner_register_customer_id as reg_cust_id,
+sinst.owner_entity_id_of_subscription,
+--offering_subscription_instance_id as offer_subs_inst_id,
+        MAX(CASE WHEN property_code = 'CN_OFFER_DESC' THEN property_value ELSE NULL END) AS Offer_Desc,
+        MAX(CASE WHEN property_code = 'CN_DISCOUNT_VALUE' THEN property_value ELSE NULL END) AS Disc_Value,
+        MAX(CASE WHEN property_code = 'CN_DISCOUNT_TYPE' THEN property_value ELSE NULL END) AS Discount_type,
+        MAX(CASE WHEN property_code = 'CN_CRM_PARTCODE' then property_value ELSE NULL end) as CRM_Part_code
+--row_number() over(partition by offering_subscription_instance_id, property_code Order by creation_time desc) as rn
+from bdl_raw.cbs_BC_OFFERING_PROP prop
+left join
+bdl_raw.cbs_bc_offering_inst sinst
+      on 
+      prop.offering_subscription_instance_id = sinst.offering_subscription_instance_id
+where property_code in ('CN_DISCOUNT_TYPE', 'CN_OFFER_DESC', 'CN_DISCOUNT_VALUE', 'CN_CRM_PARTCODE')
+and prop.offering_id = 1000108
+--and property_code is not NULL
+group by 1,2
+),
+
+offer_disc as (
+select 
+sub.billingaccountnumber ban,
+cast(offer.disc_value as double) as disc_value
+from offer_prop as offer
+left join 
+bdl_raw.cbs_bc_subscriber subs
+on offer.owner_entity_id_of_subscription = subs.subscriber_id
+left join
+bdl_dm.dimsubs sub
+on
+sub.subscriberid = subs.third_party_subscriber_key
+where offer.Disc_Value is not null
+),
+
+charged as (
+Select * from bdl_finance.be_soa_bangl_history_subset
+where product_id='1000108'
+),
+
+discount as (
+Select * from bdl_finance.be_soa_bangl_history bangl            ---------------------zero output in case og history1 table
+inner join bdl_raw.cbs_pm_offering_baseinfo prod
+on cast(bangl.product_id as BIGINT) = prod.offering_id
+where  prod.primary_offering_flag = 'P'
+and bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+),
+
+charged_disc as (
+select charged.iban,charged.invoice_detail_id, charged.net_amount as discount, discount.billed_date,discount.net_amount 
+from
+charged
+inner join
+discount
+on charged.iban = discount.iban
+where charged.net_amount <> 0)
+
+
+
+select chd.iban,chd.invoice_detail_id,chd.billed_date,
+    round(((chd.net_amount*ofd.disc_value)/100)*-1,2) as expected_disc,
+    round(chd.discount, 2)  as discnt,
+    case 
+        when round(chd.discount, 2) = round(((chd.net_amount*ofd.disc_value)/100)*-1,2) then 'Matched'
+		WHEN ofd.ban IS NULL THEN 'CRM data not available'
+    else 'Unmatched'
+    end as reconciled
+from charged_disc as chd 
+left join
+offer_disc as ofd
+on
+ofd.ban = chd.iban
+where chd.iban in (select distinct ban from bdl_finance.be_temp_base2_subset
+where name ilike '%Community%')
+)
+
+,
+ Waiver_CTE_normal AS (
+ With  CTE10 AS 
+ (
+ with term_waiver as (
+select * from bdl_finance.be_temp_base2_subset  c
+ where CAST(TO_DATE(created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+ and (c.name ILIKE '%Termination%waiver%' or c.name ilike '%Connection%Fee%Waiver%' or c.name ilike 'stc Device Contract Termination Agent Waiver')
+ 
+ 
+ ),
+ term_waiver_cbs as (
+ select * from bdl_finance.be_soa_bangl_history_subset b
+where (b.descrip ilike '%Termination%waiver%' or b.descrip ilike '%Connection%Fee%Waiver%' or b.descrip ilike 'stc Device Contract Termination Agent Waiver'
+or( b.item_name in ( 'Penalty Charges','Fee Deduction') and b.product_name ilike '%Termination%waiver%')
+	or( b.item_name in ( 'Penalty Charges','Fee Deduction') and b.product_name ilike '%contract%waiver%'))
+ ),
+ 
+
+termination_waiver as( 
+select  b.iban, b.descrip,b.billed_date, b.invoice_detail_id, c.integration_id, ROUND(c.discount, 3) AS expected_disc,CAST(ROUND(b.net_amount, 3) AS DECIMAL(38,3)) AS discnt,
+           CASE 
+    WHEN b.net_amount = c.discount THEN 'Matched'
+    WHEN c.ban IS NULL THEN 'CRM data not available'
+    ELSE 'Unmatched'
+    end as reconciled
+    from term_waiver_cbs as b
+    left join  term_waiver c
+    on b.iban = c.ban
+ 
+ )
+  select * from termination_waiver
+)
+  ,
+CTE20 as
+  (
+/*with term_waiver_crm as (
+select * from bdl_finance.be_temp_base2_subset  c
+ where CAST(TO_DATE(created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+ and c.name ILIKE '%Termination%waiver%' 
+ --and ban = '1-10098045860'
+ 
+ 
+ ),
+ term_waiver_cbs as (
+ select * from bdl_finance.be_soa_bangl_history_subset b
+	where b.descrip ilike '%Termination%waiver%'
+ ),
+termination_waiver as(
+ select  b.iban, b.descrip,b.billed_date, ROUND(c.discount, 0) AS expected_disc, ROUND(b.net_amount, 0) AS discnt,
+           CASE 
+    WHEN b.net_amount = c.discount THEN 'Matched'
+    WHEN c.ban IS NULL THEN 'CRM data not available'
+    ELSE 'Unmatched'
+    end as reconciled
+    from term_waiver_cbs as b
+    left join  term_waiver_crm c
+    on b.iban = c.ban
+ 
+ ),*/
+ with crm_data as
+ (
+ select * from bdl_finance.be_temp_base2_subset c
+ where (c.name ILIKE '%Plan%waiver%' or c.name ilike 'Plan change - Advance MRC Discount' ) 
+ AND CAST(TO_DATE(created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+        and nvl(c.integration_id, '0') not in (select nvl(integration_id, '1') from CTE10 )
+        ) ,
+ cte2 as
+(
+SELECT 
+    a.iban, 
+    a.descrip, 
+    a.billed_date,  
+    a.invoice_detail_id,
+    b.integration_id,
+    ROUND(
+        ((DATEDIFF(
+            created,
+            ADD_MONTHS(
+                CAST(CONCAT(SUBSTR(a.bill_cycle, 1, 4), '-', SUBSTR(a.bill_cycle, 5, 2), '-', SUBSTR(a.bill_cycle, 7, 2)) AS DATE),
+                1
+            )
+        ) * b.discount) / 
+        DATEDIFF(
+            CAST(CONCAT(SUBSTR(a.bill_cycle, 1, 4), '-', SUBSTR(a.bill_cycle, 5, 2), '-', SUBSTR(a.bill_cycle, 7, 2)) AS DATE),
+            ADD_MONTHS(
+                CAST(CONCAT(SUBSTR(a.bill_cycle, 1, 4), '-', SUBSTR(a.bill_cycle, 5, 2), '-', SUBSTR(a.bill_cycle, 7, 2)) AS DATE),
+                1
+            )
+        )), 3) AS expected_disc,
+		a.net_amount AS discnt,
+    CASE 
+        WHEN a.net_amount = ROUND(
+            ((DATEDIFF(
+                created,
+                ADD_MONTHS(
+                    CAST(CONCAT(SUBSTR(a.bill_cycle, 1, 4), '-', SUBSTR(a.bill_cycle, 5, 2), '-', SUBSTR(a.bill_cycle, 7, 2)) AS DATE),
+                    1
+                )
+            ) * b.discount) / 
+            DATEDIFF(
+                CAST(CONCAT(SUBSTR(a.bill_cycle, 1, 4), '-', SUBSTR(a.bill_cycle, 5, 2), '-', SUBSTR(a.bill_cycle, 7, 2)) AS DATE),
+                ADD_MONTHS(
+                    CAST(CONCAT(SUBSTR(a.bill_cycle, 1, 4), '-', SUBSTR(a.bill_cycle, 5, 2), '-', SUBSTR(a.bill_cycle, 7, 2)) AS DATE),
+                    1
+                )
+            )), 3) 
+        THEN 'Matched'
+        WHEN b.ban IS NULL THEN 'CRM data not available'
+        ELSE 'Unmatched'
+    END AS reconciled
+FROM bdl_finance.be_soa_bangl_history_subset a
+left join crm_data b
+on a.iban = b.ban
+WHERE a.invoice_detail_id not in (select invoice_detail_id from  CTE10)
+    AND (a.descrip ILIKE 'Plan change - Advance MRC Discount' OR a.descrip ILIKE 'Plan change waiver' OR a.descrip ILIKE '%Plan Change MRC Waiver%')
+   -- and iban='1-10098045860'
+)
+
+select * from cte2 --where reconciled = 'CRM data not available'
+
+),
+
+waiver_exclusion_crm as
+(
+    select integration_id from bdl_finance.be_temp_base2_subset  
+    where (name ILIKE '%Termination%waiver%' 
+            or name ilike '%Connection%Fee%Waiver%' 
+            or name ILIKE '%Plan%waiver%' 
+            or name ilike 'Plan change - Advance MRC Discount' 
+            or name  ILIKE '%month %waiver'
+			or name ilike 'stc Device Contract Termination Agent Waiver')
+),
+
+waiver_exclusion_cbs as
+(
+    select invoice_detail_id from bdl_finance.be_soa_bangl_history_subset a 
+    where (a.descrip ILIKE 'Plan change - Advance MRC Discount' 
+            OR a.descrip ILIKE 'Plan change waiver' 
+            OR a.descrip ILIKE '%Plan Change MRC Waiver%' 
+            or a.descrip ilike '%Termination%waiver%' 
+            or a.descrip ilike '%Connection%Fee%Waiver%'
+			or a.descrip ilike 'stc Device Contract Termination Agent Waiver'
+			or a.product_name ilike '%Termination%waiver%'
+	        or a.product_name ilike '%contract%waiver%')
+
+),
+
+cte30 as
+
+(
+  /*with term_waiver1 as (
+select * from bdl_finance.be_temp_base2_subset  c
+ where CAST(TO_DATE(created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+ and c.name ILIKE '%Termination%waiver%' 
+ --and ban = '1-10098045860'
+ 
+ 
+ ),
+ term_waiver_cbs1 as (
+	select * from bdl_finance.be_soa_bangl_history_subset b
+	where	b.descrip ilike '%Termination%waiver%'
+	),*/
+
+with crm_data1 as(
+  select * from bdl_finance.be_temp_base2_subset c
+ where cast(to_date(created) as date format 'yyyy-mm-dd') <  ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE),
+            1
+        )
+and c.name ILIKE '%waiver%' 
+and (c.name not ILIKE '%Plan%waiver%' or c.name not ilike 'Plan change - Advance MRC Discount' or c.name not ILIKE '%Termination%waiver%' or c.name not ilike '%Connection%Fees%Waiver%') 
+and nvl(c.integration_id, '0') not in (select nvl(integration_id, '1')  from waiver_exclusion_crm)
+),
+
+cbs_data as 
+(
+select * from bdl_finance.be_soa_bangl_history_subset b
+    where b.descrip ILIKE '%waiver%'
+    and b.invoice_detail_id not in (select invoice_detail_id from  waiver_exclusion_cbs)
+	and b.invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+   -- and b.iban='1-10098045860'
+
+
+
+ ),
+ Cycle1 AS (
+    SELECT b.iban, b.descrip,b.billed_date,b.invoice_detail_id, c.integration_id, ROUND(c.discount, 3) AS expected_disc, ROUND(b.net_amount, 3) AS discnt,
+           CASE WHEN ROUND(b.net_amount, 3) = ROUND(c.discount, 3) THEN 'Matched'
+            WHEN c.ban IS NULL THEN 'CRM data not available'
+            ELSE 'Unmatched' 
+            END AS reconciled
+FROM cbs_data b
+LEFT JOIN crm_data1 c ON b.iban = c.ban
+
+  )
+  SELECT * FROM Cycle1
+  --where iban not in (select iban  from cte20)
+)
+   
+   select * from CTE10
+   union 
+   select * from CTE20
+   union 
+   select * from CTE30
+
+),
+Shared_child_Normal as(
+ with sc1_cte as
+ (
+ WITH  crm_child_agg AS (
+    SELECT *, discount AS n_disc
+    FROM bdl_finance.be_temp_base2_subset
+    WHERE (name ILIKE 'stc Business Shared Child Promo Plan Discount')
+  ),
+  crm_child_agg1 as
+(
+    SELECT ban, SUM(n_disc) AS agg_n_disc
+    FROM crm_child_agg
+    GROUP BY 1
+
+),
+  cbs_child_data as
+  (
+  select * from bdl_finance.be_soa_bangl_history_subset b
+  where (b.descrip ILIKE '%Shared Child Dis%' or b.descrip ilike 'Business Shared SIM Promotion Discount')
+  and b.invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+  )
+      SELECT b.iban,b.billed_date, ROUND(c.agg_n_disc, 2) AS expected_disc, ROUND(b.net_amount, 2) AS discnt,
+           CASE WHEN b.net_amount = c.agg_n_disc THEN 'Matched' 
+           WHEN c.ban IS NULL THEN 'CRM data not available' 
+           ELSE 'Unmatched' END AS reconciled
+    FROM cbs_child_data b
+    inner JOIN crm_child_agg1 c ON b.iban = c.ban
+ ),
+ sc2_cte as(
+ WITH  crm_child_agg AS (
+    SELECT *, discount * -1 AS n_disc
+    FROM bdl_finance.be_temp_base2_subset
+    WHERE (name ILIKE '%Shared Child%Plan%' or name ilike 'Business Shared SIM Promotion Discount')
+	and name not ilike 'stc Business Shared Child Promo Plan Discount'
+  ),
+  crm_child_agg1 AS (
+    SELECT ban, SUM(n_disc) AS agg_n_disc
+    FROM crm_child_agg
+    GROUP BY 1
+  ),
+  cbs_child_data as
+  (
+  select * from bdl_finance.be_soa_bangl_history_subset b
+  where (b.descrip ILIKE '%Shared Child Dis%' or b.descrip ilike 'Business Shared SIM Promotion Discount')
+  and b.invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+  ),
+  Cycle1 AS (
+    SELECT b.iban,b.billed_date, ROUND(c.agg_n_disc, 2) AS expected_disc, ROUND(b.net_amount, 2) AS discnt,
+           CASE WHEN b.net_amount = c.agg_n_disc THEN 'Matched' 
+           WHEN c.ban IS NULL THEN 'CRM data not available' 
+           ELSE 'Unmatched' END AS reconciled
+    FROM cbs_child_data b
+    Left JOIN crm_child_agg1 c ON b.iban = c.ban
+    where b.iban not in (select iban from sc1_cte)
+  )
+  
+  SELECT * FROM Cycle1
+   )
+   
+   select * from sc1_cte
+   union
+   select * from sc2_cte
+   )
+,
+
+
+Employee_discount_CTE as (
+with Employee_discount_CTE1 AS (
+with cbs_billing AS (
+    SELECT iban, bill_cycle,billed_date, descrip, item_name, product_name, net_amount AS net_amount
+    FROM bdl_finance.be_soa_bangl_history_subset
+    where descrip ILIKE '%employee%group%'
+	and invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+
+  )
+ ,
+ cbs_billing_1 as
+  (WITH employee_leaving AS (
+  SELECT *
+  FROM bdl_finance.be_soa_bangl_history_subset
+  WHERE descrip ILIKE 'Employee Leaving Billing Discount'
+  and invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+) ,
+previous_cycle AS (  
+  SELECT 
+  iban,
+  CONCAT(
+    CAST(YEAR(add_months(from_unixtime(unix_timestamp(bill_cycle, 'yyyyMMdd')), -1)) AS STRING),
+    LPAD(CAST(MONTH(add_months(from_unixtime(unix_timestamp(bill_cycle, 'yyyyMMdd')), -1)) AS STRING), 2, '0'),
+    LPAD(CAST(DAY(add_months(from_unixtime(unix_timestamp(bill_cycle, 'yyyyMMdd')), -1)) AS STRING), 2, '0')
+  ) AS bill_cycle
+FROM employee_leaving
+)
+SELECT s.iban, s.bill_cycle, s.billed_date, s.descrip, s.item_name, s.product_name, s.net_amount,CAST(TRIM(regexp_extract(s.descrip, '\\d+', 0)) AS INT) AS max_emp_disc
+FROM bdl_finance.be_soa_bangl_history s
+JOIN previous_cycle p 
+  ON s.iban = p.iban 
+  AND s.bill_cycle = p.bill_cycle
+WHERE s.item_name IN ('Monthly Fee', 'Billing Discount')
+  AND s.net_amount < 0
+ 
+  )
+  ,
+
+ cbs_emp_iban_pkg as
+ (with cbs_emp_iban_pkg1 AS (
+    SELECT iban, descrip, billed_date,agg_disc, NVL(max_emp_disc, 0) AS max_emp_disc
+    FROM (
+      SELECT iban, descrip,billed_date, SUM(net_amount) AS agg_disc,
+             CAST(TRIM(regexp_extract(descrip, '\\d+', 0)) AS INT) AS max_emp_disc
+      FROM cbs_billing
+      WHERE descrip ILIKE '%employee%group%'
+     -- AND descrip ILIKE '%BD%'
+     --and iban in ('1-11315381132','1-6751033734')
+      GROUP BY 1, 2,3
+    ) a
+  ) ,
+  cbs_emp_iban_pkg2 AS (
+   SELECT a.iban, a.descrip, a.billed_date,a.net_amount as agg_disc,b.max_emp_disc
+   from bdl_finance.be_soa_bangl_history_subset a
+   inner join cbs_billing_1 b
+   on a.iban=b.iban
+   where a.bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+   and a.descrip ilike 'Employee Leaving Billing Discount'
+  )
+/* select * from cbs_emp_iban_pkg1
+ union */
+ select * from cbs_emp_iban_pkg2 )
+,
+  employee_bans AS (
+    SELECT ban.OU_NUM AS parent_ban
+    FROM bdl_raw.CRM_S_ORG_EXT ban
+    LEFT JOIN bdl_raw.CRM_S_ORG_EXT_X banx ON ban.ROW_ID = banx.PAR_ROW_ID
+    WHERE banx.ATTRIB_06 = 'Employee'
+  ),
+  employee_appld_disc AS (
+    SELECT cbs.iban, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM employee_bans pb 
+    inner JOIN cbs_emp_iban_pkg cbs ON pb.parent_ban = cbs.iban
+    --where cbs.iban in ('1-11315381132','1-6751033734')
+  ),
+  child_appld_disc AS (
+    SELECT ban.OU_NUM AS PARENT_BAN, cb.ATTRIB_34 AS CHILD_BAN, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM bdl_raw.crm_S_ORG_EXT ban
+    JOIN bdl_raw.CRM_S_ORG_EXT_XM cb ON cb.PAR_ROW_ID = ban.ROW_ID
+    Inner JOIN cbs_emp_iban_pkg cbs ON cbs.iban = cb.ATTRIB_34
+    where  cb.TYPE = 'EMPLOYEE'
+    --and cbs.iban='1-6751033734'
+    --AND cb.ATTRIB_01 IN ('Active')
+    AND cbs.iban IS NOT NULL
+  )
+   ,
+  child_disc_agg AS ( 
+    SELECT PARENT_BAN,billed_date, SUM(agg_disc) AS agg_disc
+    FROM child_appld_disc
+    GROUP BY 1,2
+  ),
+  recon AS (
+    select iban,disc1,max_emp_disc_1 as max_emp_disc,recon from (SELECT 
+    iban,  
+    disc1,
+    CASE 
+      WHEN max_emp_disc = 0 THEN disc1
+      WHEN disc1 <= max_emp_disc THEN disc1
+      ELSE max_emp_disc
+    END AS max_emp_disc_1,
+           CASE WHEN max_emp_disc = 0 THEN 'Matched'
+                WHEN disc1 <= max_emp_disc THEN 'Matched'
+                ELSE 'Unmatched' END AS recon
+    FROM (
+      SELECT p.iban, CAST(p.max_emp_disc AS DOUBLE) AS max_emp_disc,
+             (CAST(p.agg_disc + NVL(c.agg_disc, 0) AS DOUBLE) * -1) AS disc1,
+             ROW_NUMBER() OVER (PARTITION BY p.iban ORDER BY p.max_emp_disc DESC) AS top1
+      FROM employee_appld_disc AS p
+      LEFT JOIN child_disc_agg AS c ON p.iban = c.PARENT_BAN
+    ) a
+    WHERE top1 = 1)a 
+  )
+  SELECT --'Parent' AS Ctgy,
+         emp.iban, descrip, billed_date,/*recon.disc1*/emp.agg_disc AS discnt, emp.max_emp_disc AS expected_disc, recon.recon as reconciled
+  FROM employee_appld_disc emp
+  INNER JOIN recon ON emp.iban = recon.iban
+  UNION
+  SELECT -- 'Child' AS Ctgy,
+         CHILD_BAN, descrip,billed_date,
+         /*recon.disc1*/NVL(child.agg_disc, 0) AS discnt, 
+         child.max_emp_disc AS expected_disc, recon.recon AS reconciled
+  FROM child_appld_disc child
+  INNER JOIN recon ON child.PARENT_BAN = recon.iban
+  ),
+  
+
+Employee_discount_CTE2 as (
+
+with cbs_billing AS ( 
+    SELECT iban, bill_cycle,billed_date, descrip, item_name, product_name, net_amount AS net_amount
+    FROM bdl_finance.be_soa_bangl_history_subset
+    where descrip ILIKE '%employee%group%'
+	and invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+  )
+ ,
+
+ cbs_emp_iban_pkg as
+ ( SELECT iban, descrip, billed_date,agg_disc, NVL(max_emp_disc, 0) AS max_emp_disc
+    FROM (
+      SELECT iban, descrip,billed_date, SUM(net_amount) AS agg_disc,
+             CAST(TRIM(regexp_extract(descrip, '\\d+', 0)) AS INT) AS max_emp_disc
+      FROM cbs_billing
+      WHERE descrip ILIKE '%employee%group%'
+     -- AND descrip ILIKE '%BD%'
+     --and iban in ('1-11315381132','1-6751033734')
+      GROUP BY 1, 2,3
+    ) a
+)
+,
+  employee_bans AS (
+    SELECT ban.OU_NUM AS parent_ban
+    FROM bdl_raw.CRM_S_ORG_EXT ban
+    LEFT JOIN bdl_raw.CRM_S_ORG_EXT_X banx ON ban.ROW_ID = banx.PAR_ROW_ID
+    WHERE banx.ATTRIB_06 = 'Employee'
+  ) ,
+  employee_appld_disc AS ( 
+    SELECT cbs.iban, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM employee_bans pb 
+    inner JOIN cbs_emp_iban_pkg cbs ON pb.parent_ban = cbs.iban
+    --where cbs.iban in ('1-11315381132','1-6751033734')
+  ),
+  child_appld_disc AS (
+    SELECT ban.OU_NUM AS PARENT_BAN, cb.ATTRIB_34 AS CHILD_BAN, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM bdl_raw.crm_S_ORG_EXT ban
+    JOIN bdl_raw.CRM_S_ORG_EXT_XM cb ON cb.PAR_ROW_ID = ban.ROW_ID
+    inner JOIN cbs_emp_iban_pkg cbs ON cbs.iban = cb.ATTRIB_34
+    where  cb.TYPE = 'EMPLOYEE'
+    --and cbs.iban='1-6751033734'
+    --AND cb.ATTRIB_01 IN ('Active')
+    AND cbs.iban IS NOT NULL
+  )
+   ,
+  child_disc_agg AS ( 
+    SELECT PARENT_BAN as iban,billed_date, SUM(agg_disc) AS disc1,max_emp_disc
+    FROM child_appld_disc
+    GROUP BY 1,2,4
+  ),
+  recon AS (
+    select iban,disc1,max_emp_disc_1 as max_emp_disc,recon from (SELECT 
+    iban,  
+    disc1,
+    CASE 
+      WHEN max_emp_disc = 0 THEN disc1
+      WHEN disc1 <= max_emp_disc THEN disc1
+      ELSE max_emp_disc
+    END AS max_emp_disc_1,
+    CASE 
+      WHEN max_emp_disc = 0 THEN 'Matched'
+      WHEN disc1 <= max_emp_disc THEN 'Matched'
+      ELSE 'Unmatched' 
+    END AS recon
+    FROM child_disc_agg)b
+    )
+    
+
+  SELECT -- 'Child' AS Ctgy,
+         CHILD_BAN, descrip,billed_date,
+         /*recon.disc1*/NVL(child.agg_disc, 0) AS discnt,
+         child.max_emp_disc AS expected_disc, recon.recon AS reconciled
+  FROM child_appld_disc child
+  INNER JOIN recon ON child.PARENT_BAN = recon.iban),
+  
+  Employee_discount_CTE3 as  
+(with cbs_billing as 
+(
+SELECT iban, bill_cycle,billed_date, descrip, item_name, product_name, net_amount AS net_amount
+    FROM bdl_finance.be_soa_bangl_history_subset
+    where descrip ILIKE '%employee%group%'
+    and iban not in (select child_ban from employee_discount_cte2)
+	and invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+)
+
+
+,
+
+
+cbs_emp_iban_pkg as
+ ( SELECT iban, descrip, billed_date,agg_disc, NVL(max_emp_disc, 0) AS max_emp_disc
+    FROM (
+      SELECT iban, descrip,billed_date, SUM(net_amount) AS agg_disc,
+             CAST(TRIM(regexp_extract(descrip, '\\d+', 0)) AS INT) AS max_emp_disc
+      FROM cbs_billing
+      WHERE descrip ILIKE '%employee%group%'
+     -- AND descrip ILIKE '%BD%'
+     --and iban in ('1-11315381132','1-6751033734')
+      GROUP BY 1, 2,3
+    ) a
+),
+
+employee_bans as(
+SELECT ban.OU_NUM AS parent_ban
+    FROM bdl_raw.CRM_S_ORG_EXT ban
+    LEFT JOIN bdl_raw.CRM_S_ORG_EXT_X banx ON ban.ROW_ID = banx.PAR_ROW_ID
+    WHERE banx.ATTRIB_06 = 'Employee'
+),
+
+
+employee_appld_disc as
+(
+SELECT cbs.iban, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM employee_bans pb 
+    inner JOIN cbs_emp_iban_pkg cbs ON pb.parent_ban = cbs.iban
+),
+
+ child_appld_disc AS (
+    SELECT ban.OU_NUM AS PARENT_BAN, cb.ATTRIB_34 AS CHILD_BAN, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM bdl_raw.crm_S_ORG_EXT ban
+    JOIN bdl_raw.CRM_S_ORG_EXT_XM cb ON cb.PAR_ROW_ID = ban.ROW_ID
+    LEFT JOIN cbs_emp_iban_pkg cbs ON cbs.iban = cb.ATTRIB_34
+    where  cb.TYPE = 'EMPLOYEE'
+    --and cbs.iban='1-6751033734'
+    --AND cb.ATTRIB_01 IN ('Active')
+    AND cbs.iban IS NOT NULL
+  )
+   ,
+  child_disc_agg AS ( 
+     SELECT PARENT_BAN,billed_date, SUM(agg_disc) AS agg_disc
+    FROM child_appld_disc
+    GROUP BY 1,2
+  ),
+
+
+  recon AS (
+
+   SELECT 
+  iban, 
+  max_emp_disc_1 as max_emp_disc, 
+  disc1,
+  recon 
+FROM (
+  SELECT 
+    iban,  
+    disc1,
+    CASE 
+      WHEN max_emp_disc = 0 THEN disc1
+      WHEN disc1 <= max_emp_disc THEN disc1
+      ELSE max_emp_disc
+    END AS max_emp_disc_1,
+    CASE 
+      WHEN max_emp_disc = 0 THEN 'Matched'
+      WHEN disc1 <= max_emp_disc THEN 'Matched'
+      ELSE 'Unmatched' 
+    END AS recon
+  FROM (
+    SELECT 
+      p.iban, 
+      CAST(p.max_emp_disc AS DOUBLE) AS max_emp_disc,
+      (CAST(p.agg_disc + NVL(c.agg_disc, 0) AS DOUBLE) * -1) AS disc1,
+      ROW_NUMBER() OVER (PARTITION BY p.iban ORDER BY p.max_emp_disc DESC) AS top1
+    FROM employee_appld_disc AS p
+    LEFT JOIN child_disc_agg AS c 
+      ON p.iban = c.PARENT_BAN
+  ) a
+  WHERE top1 = 1
+) b
+  )
+
+
+
+
+
+SELECT --'Parent' AS Ctgy,
+         emp.iban, descrip, billed_date,/*recon.disc1*/emp.agg_disc AS discnt, emp.max_emp_disc AS expected_disc, recon.recon as reconciled
+  FROM employee_appld_disc emp
+  INNER JOIN recon ON emp.iban = recon.iban
+  UNION
+  SELECT -- 'Child' AS Ctgy,
+         CHILD_BAN, descrip,billed_date,
+         /*recon.disc1*/NVL(child.agg_disc, 0) AS discnt, 
+         child.max_emp_disc AS expected_disc, recon.recon AS reconciled
+  FROM child_appld_disc child
+  INNER JOIN recon ON child.PARENT_BAN = recon.iban
+
+)
+
+  select iban,billed_date,discnt,case when reconciled = 'Matched' then discnt
+else expected_disc  end AS expected_disc,reconciled from Employee_discount_CTE1
+  union
+  select CHILD_BAN as iban,billed_date,discnt,case when reconciled = 'Matched' then discnt
+else expected_disc  end AS expected_disc,reconciled from Employee_discount_CTE2
+  union
+  select iban,billed_date,discnt,case when reconciled = 'Matched' then discnt
+else expected_disc  end AS expected_disc,reconciled from Employee_discount_CTE3
+)
+
+,
+ Bussiness_line_CTE_norm AS (
+  WITH  disc_lines AS (
+    SELECT prop.owner_register_customer_id AS reg_cust_id, sinst.owner_entity_id_of_subscription,
+           MAX(CASE WHEN property_code = 'CN_DISCOUNT_LINES' THEN property_value ELSE NULL END) AS Disc_lines
+    FROM bdl_raw.cbs_BC_OFFERING_PROP prop
+    LEFT JOIN bdl_raw.cbs_bc_offering_inst sinst ON prop.offering_subscription_instance_id = sinst.offering_subscription_instance_id
+    WHERE property_code = 'CN_DISCOUNT_LINES'
+    AND prop.offering_id = 1000106
+    GROUP BY 1, 2
+  ),
+  cbs_ext AS (
+    SELECT acct.account_code AS ban, dsclin.*
+    FROM disc_lines AS dsclin
+    LEFT JOIN bdl_raw.cbs_bc_acct acct ON dsclin.owner_entity_id_of_subscription = acct.account_id
+    AND acct.account_code IS NOT NULL
+  ) ,
+  ext_crm_cbs AS ( 
+    SELECT base.*, ext.Disc_lines
+    FROM bdl_finance.be_temp_base2_subset base
+    INNER JOIN cbs_ext ext ON base.ban = ext.ban
+WHERE name = 'stc Business One Extension'
+--and base.discount>0
+),
+  cnt_ext AS (
+    SELECT ban, Disc_lines, discount, COUNT(*) AS cnt
+    FROM ext_crm_cbs
+    WHERE TRIM(name) = 'stc Business One Extension'
+    AND discount IS NOT NULL
+    GROUP BY 1, 2, 3
+  ),
+  disc_line_calculated AS (
+    SELECT DISTINCT a.Ban, cnt.discount, a.disc_lines, cnt.cnt AS total_lines
+    FROM (
+      SELECT ban, discount, Disc_lines
+      FROM ext_crm_cbs
+      WHERE name = 'stc Business One Extension'
+      GROUP BY 1, 2, 3
+    ) a
+    LEFT JOIN cnt_ext AS cnt ON a.ban = cnt.ban
+  ),
+  calc_disc AS (
+    SELECT ban, SUM(NODL * discount) * -1 AS disc_calc
+    FROM (
+      SELECT *,
+             CASE
+               WHEN CAST(disc_lines AS INT) >= rsum THEN total_lines
+               ELSE (
+                 CASE
+                   WHEN CAST(disc_lines AS INT) - rsum_lag >= 0 THEN CAST(disc_lines AS INT) - rsum_lag
+                   ELSE 0
+                 END
+               )
+             END AS NODL
+      FROM (
+        SELECT *,
+               NVL(LAG(rsum) OVER (PARTITION BY ban ORDER BY discount), 0) AS rsum_lag
+        FROM (
+          SELECT *,
+                 SUM(total_lines) OVER (PARTITION BY ban ORDER BY discount) AS rsum
+          FROM disc_line_calculated
+        ) a
+      ) b
+    ) c
+    GROUP BY 1
+  ),
+  cbs_charged AS (
+    SELECT *
+    from bdl_finance.be_soa_bangl_history_subset
+    where descrip ilike 'stc Business DIS Extension Offer'
+	and invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+  )
+  SELECT cc.iban,cc.billed_date, 
+  cd.disc_calc AS expected_disc, cc.net_amount AS discnt,
+         CASE WHEN cd.disc_calc = cc.net_amount THEN 'Matched' 
+		 WHEN cd.ban IS NULL THEN 'CRM data not available'
+		 ELSE 'Unmatched' END AS reconciled
+   FROM cbs_charged AS cc
+  left JOIN calc_disc AS cd ON cd.ban = cc.iban
+)
+,
+
+ Addon_disc_CTE_norm as
+(with  crm_addon_disc as(
+        select *
+        from bdl_finance.be_temp_base2_subset c
+        where name ilike 'stc Discount Add%on%'
+   --   AND (c.end_dt IS NULL OR cast(to_date(c.end_dt) as date format 'yyyy-mm-dd')> l.cycle_1_date)
+),
+ 
+child_disc_union as
+(
+select
+source
+,ban
+,created
+,end_dt
+,discount
+,name
+,integration_id
+,orig_order_id
+--,price_type_cd
+from crm_addon_disc
+),
+ 
+crm_addon_agg as 
+(
+select ban, sum(discount) as agg_n_disc from child_disc_union group by 1
+),
+ 
+addon_cbs as
+(
+select 
+iban,
+bill_cycle,
+descrip,
+item_name,
+product_name,
+billed_date,
+net_amount as net_amount
+from bdl_finance.be_soa_bangl_history_subset as b
+where descrip ilike 'stc Discount Add-on%'
+and b.invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+),
+ 
+cbs_addon_agg as 
+(
+select iban,billed_date, sum(net_amount) as net_amount from addon_cbs group by 1,2
+)
+ 
+select cbs.iban,cbs.billed_date,
+round(crm.agg_n_disc, 3) as crm_amount,
+round(cbs.net_amount, 3) as cbs_amount,
+case 
+    when round(crm.agg_n_disc,3) = round(cbs.net_amount, 3) then "Matched" 
+    when round(crm.agg_n_disc,3) * 2 = round(cbs.net_amount, 3) then "Double" 
+    WHEN crm.ban IS NULL THEN 'CRM data not available' 
+    else 'Unmatched'
+    end as reconciled
+from cbs_addon_agg as cbs 
+left join crm_addon_agg  as crm
+on
+crm.ban = cbs.iban
+
+),
+ rental_disc_norm as
+(
+with crm_rental as(
+select * from bdl_finance.be_temp_base2_subset 
+where (name ilike '%rental%disc%' or name ilike 'Postpaid HE1 Plan 24 Months MRC Discount')
+--AND (c.end_dt IS NULL OR cast(to_date(c.end_dt) as date format 'yyyy-mm-dd')>l.cycle_1_date)
+),
+
+crm_rental_agg as (
+select ban,sum(round(discount,3)) as agg_discount from crm_rental
+group by 1),
+
+cbs_rental as (
+select * from bdl_finance.be_soa_bangl_history_subset as b
+where b.descrip ilike '%rental%'
+and b.invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+
+),
+
+cbs_rental_agg as (
+select iban,billed_date, sum(net_amount) as agg_netAmount from cbs_rental
+group by 1,2
+)
+
+
+select cbs.iban,cbs.billed_date, crm.agg_discount, cbs.agg_netamount,
+case when round(crm.agg_discount,3) = round(cbs.agg_netamount,3) then 'Matched'
+WHEN crm.ban IS NULL THEN 'CRM data not available' 
+else 'Unmatched' end as reconciled
+from cbs_rental_agg cbs 
+left join
+crm_rental_agg as crm
+on
+crm.ban = cbs.iban
+--where crm.ban is not null
+
+
+),
+Overall_recon_cte as(
+SELECT 'Device promo' AS ctgy,
+       D.iban as iban,
+      -- '20241210' as bill_cycle,
+       CAST(D.discount AS DECIMAL(38,3)) AS expected_disc, 
+       CAST(D.net_amount AS DECIMAL(38,3)) AS discnt, 
+       D.reconciled,
+       D.billed_date 
+	   from Device_discount_CTE_norm D
+	   union all
+SELECT 'promo_disc' AS ctgy,
+       p.iban as iban,
+      -- '20241210' as bill_cycle,
+       CAST(p.discount AS DECIMAL(38,3)) AS expected_disc, 
+       CAST(p.net_amount AS DECIMAL(38,3)) AS discnt, 
+       p.reconciled,
+       p.billed_date 
+FROM Promo_discount_CTE_norm P
+union all
+SELECT 'Shared Child' AS ctgy,
+       S.iban as iban,
+      -- '20241210' as bill_cycle,
+       CAST(S.expected_disc AS DECIMAL(38,3)) AS expected_disc, 
+       CAST(S.discnt AS DECIMAL(38,3)) AS discnt, 
+       S.reconciled,
+       S.billed_date 
+FROM Shared_child_Normal S 
+UNION ALL 
+SELECT 'Waiver' AS ctgy,
+       W.iban as iban, 
+     --  '20241210' as bill_cycle,
+       CAST(W.expected_disc AS DECIMAL(38,3)) AS expected_disc, 
+       CAST(W.discnt AS DECIMAL(38,3)) AS discnt, 
+       W.reconciled,
+      W.billed_date as bill_date 
+FROM Waiver_CTE_normal W
+UNION ALL
+SELECT 'Employee disc' AS ctgy,
+       E.iban as iban, 
+     --  '20241210' as bill_cycle,
+       CAST(E.expected_disc AS DECIMAL(38,3))*-1 AS expected_disc, 
+       CAST(E.discnt AS DECIMAL(38,3)) AS discnt, 
+       E.reconciled,
+       E.billed_date 
+FROM Employee_discount_CTE E
+UNION ALL
+SELECT 'bussiness disc' AS ctgy,
+       B.iban as iban, 
+      -- '20241210' as bill_cycle,
+       CAST(B.expected_disc AS DECIMAL(38,3)) AS expected_disc, 
+       CAST(B.discnt AS DECIMAL(38,3)) AS discnt, 
+       B.reconciled,
+      B.billed_date 
+FROM Bussiness_line_CTE_norm B
+union all
+SELECT 'community disc' AS ctgy,
+       C.iban as iban, 
+    --   '20241210' as bill_cycle,
+       CAST(C.expected_disc AS DECIMAL(38,3)) AS expected_disc, 
+       CAST(C.discnt AS DECIMAL(38,3)) AS discnt, 
+       C.reconciled,
+      C.billed_date 
+FROM Community_disc_CTE_norm C
+union all 
+SELECT 
+      'Addon disc' AS ctgy,
+       A.iban as iban, 
+     --  '20241210' as bill_cycle,
+       CAST(A.crm_amount AS DECIMAL(38,3)) AS expected_disc, 
+       CAST(A.cbs_amount AS DECIMAL(38,3)) AS discnt, 
+       A.reconciled,
+       A.billed_date 
+FROM Addon_disc_CTE_norm A
+union all
+Select 
+      'Rental_disc' as ctgy,
+      R.iban as iban,
+    --  '20241210' as bill_cycle,
+      cast( R.agg_discount as decimal(38,3)) as expected_disc,
+      cast(R.agg_netamount as decimal(38,3)) as discnt,
+      R.reconciled,
+      R.billed_date
+FROM rental_disc_norm R
+)
+
+SELECT * from Overall_recon_cte;
+
+
+
+
+
+
+
+
+
+
+-------------------------------------------------
+
+
+
+
+Drop table if exists bdl_finance.be_complete_discount_adv_norm1half;
+Create table bdl_finance.be_complete_discount_adv_norm1half as
+WITH latest_bill_cycles_col AS (
+SELECT
+  REPLACE(
+    CASE
+      WHEN day(current_date()) < 10 THEN
+        CAST(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)) AS STRING)
+      WHEN day(current_date()) < 20 THEN
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 9) AS STRING)
+      ELSE
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 19) AS STRING)
+    END, '-', ''
+  ) AS cycle_1),
+
+
+BillCycle_PMRC as(
+	     select    bill_cycle_type,
+	     expected_disc,
+			effective_time,
+		    billed_date ,
+		    invoice_id,
+		    invoice_detail_id,
+		    account_id,
+		    iban,
+		    bill_cycle,
+            descrip,
+		    item_name,
+		    created,
+			end_dt,
+		    product_name,
+            NVL(net_amount,0) AS net_amount,
+		    load_date,
+			rnk 
+			from (
+			SELECT
+			bc.bill_cycle_type,
+			bc.effective_time,
+			b.discount as expected_disc,
+			b.created,
+			b.end_dt,
+		    bangl.billed_date ,
+		    bangl.invoice_id,
+		    bangl.invoice_detail_id,
+		    bangl.account_id,
+		    bangl.iban,
+		    bangl.bill_cycle,
+            bangl.descrip,
+		    bangl.item_name,
+		    bangl.product_name,
+            bangl.net_amount,
+		    bangl.load_date,
+			DENSE_RANK() OVER (PARTITION BY bc.account_id ORDER BY bc.expiration_time DESC) AS rnk
+		from bdl_finance.be_soa_bangl_history AS bangl
+		left JOIN 
+			bdl_raw.cbs_bc_acct_bill_cycle AS bc 
+			ON bangl.account_id = bc.account_id
+			inner join bdl_finance.be_history_record b
+			on b.ban=bangl.iban
+		
+		WHERE bangl.net_amount<0
+		and (name ILIKE '%Shared Child Plan%' or name ilike '%waiver%' or name ILIKE '%month%' or name ilike 'stc Business One Extension' )
+		and (descrip ILIKE '%Shared Child Dis%'or descrip ILIKE 'Plan change - Advance MRC Discount' or descrip ILIKE 'Plan change waiver' or descrip ILIKE '%waiver%' or descrip ilike '%	stc Business DIS Extension Offer%')
+		and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+
+		and bc.bill_cycle_type in ('1','10','20')
+		AND 
+		    bc.effective_time < (cast(trunc(add_months(now(), - 0), 'MONTH') AS DATE))
+		AND
+            bc.expiration_time > NOW()
+        AND bill_cycle in (select * from  latest_bill_cycles_col)
+            )a
+            ),
+CRM_PMRC_billcycle_1 as
+(
+      select    bill_cycle_type,
+			effective_time,
+			expected_disc,
+		    billed_date ,
+		    invoice_id,
+		    invoice_detail_id,
+		    account_id,
+		    iban,
+		    bill_cycle,
+            descrip,
+            created,
+			end_dt,
+		    item_name,
+		    product_name,
+            NVL(net_amount,0) AS net_amount,
+		    load_date,
+        Dense_rank() OVER (PARTITION BY iban ORDER BY bill_cycle DESC) AS rnk
+    FROM 
+        BillCycle_PMRC
+),
+CRM_PMRC_billcycle_2 as
+(
+    SELECT * FROM CRM_PMRC_billcycle_1
+    WHERE rnk=1
+)
+
+,
+CRM_PMRC_billcycle_3 as
+(
+    SELECT * FROM CRM_PMRC_billcycle_1
+    WHERE rnk=2
+),
+BillCycle_ids AS 
+(
+    SELECT * FROM BillCycle_PMRC
+    WHERE 
+    bill_cycle_type in ('1','10','20') 
+    AND 
+    rnk = 1
+),
+All_PMRC_billcyc as
+(
+select a.iban,
+a.billed_date,
+a.bill_cycle,
+b.bill_cycle_type,
+CASE 
+WHEN b.bill_cycle_type = '1'
+THEN  ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 0) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+--
+WHEN b.bill_cycle_type = '10' AND DAY(CURRENT_DATE()) <= 10 
+THEN ROUND((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -2), 'MONTH'), 9) AS DATE), 
+       CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE))) + 0)
+/ (DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+
+WHEN b.bill_cycle_type = '10' AND DAY(CURRENT_DATE()) > 10 
+THEN ROUND((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 9) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE))) + 0)
+/ (DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+--
+WHEN b.bill_cycle_type ='20' AND DAY(CURRENT_DATE()) <= 20 
+THEN ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -2), 'MONTH'), 19) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+
+WHEN b.bill_cycle_type ='20' AND DAY(CURRENT_DATE()) > 20 
+THEN ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 19) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+END AS expected_disc,
+a.net_amount,
+a.invoice_id,
+a.invoice_detail_id,
+a.account_id,
+a.descrip,
+a.item_name,
+a.product_name,
+a.load_date,
+a.created,
+a.end_dt
+FROM 
+    CRM_PMRC_billcycle_3 a
+INNER JOIN
+     BillCycle_ids b
+ON
+    a.iban=b.iban
+),
+adv_pro_bans as
+(SELECT 
+    distinct a.bill_cycle as pro_bill_cycle,a.iban as pro_iban--,net_amount as discnt,expected_disc,
+    /*case when net_amount=expected_disc then 'Matched'
+    else 'Unmatched' end as reconciled*/--created,end_dt,bill_cycle,expected_disc,net_amount,invoice_id,invoice_detail_id, account_id,descrip,item_name,product_name,load_date,bill_cycle_type
+FROM 
+    All_PMRC_billcyc a
+   left join latest_bill_cycles_col cyc 
+on
+cast(to_date(end_dt) as date format 'yyyy-mm-dd') > cast (cyc.cycle_1 AS DATE FORMAT 'yyyymmdd')
+OR end_dt IS NULL  
+     where cast(to_date(created) as date format 'yyyy-mm-dd') <  ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(cyc.cycle_1, 1, 4), '-', SUBSTR(cyc.cycle_1, 5, 2), '-', SUBSTR(cyc.cycle_1, 7, 2)) AS DATE),
+            1
+        )
+    ),
+    
+    
+	
+first_active_bans as
+(
+select distinct soa.iban from bdl_finance.be_soa_bangl_history soa
+inner join
+(select iban,bill_cycle,lag(bill_cycle) over (partition by iban order by billed_date) as lag_cycle from
+        (select distinct iban,bill_cycle,billed_date from bdl_finance.be_soa_bangl_history)a
+	)b 
+	on soa.iban = b.iban and soa.bill_cycle = b.bill_cycle
+	where b.lag_cycle is NULL
+	and soa.bill_cycle = (select cycle_1 from latest_bill_cycles_col)
+    and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+    and net_amount < 0
+),
+
+cbs_child_cte as
+(select invoice_detail_id 
+from bdl_finance.be_soa_bangl_history_subset
+where (descrip ilike '%child%' or descrip ilike 'Business Shared SIM Promotion Discount')
+),
+
+cbs_employee_cte as 
+(
+select 
+invoice_detail_id
+from bdl_finance.be_soa_bangl_history_subset
+where  descrip ilike '%employee%'
+),
+
+cbs_charged_bussiness as (
+Select 
+   invoice_detail_id
+    from bdl_finance.be_soa_bangl_history_subset
+    where descrip ilike 'stc Business DIS Extension Offer'
+),
+
+community_cbs_cte as
+(select invoice_detail_id from bdl_finance.be_soa_bangl_history_subset
+where product_id='1000108')
+,
+addon_cbs_cte as
+(
+select 
+invoice_detail_id
+from bdl_finance.be_soa_bangl_history_subset
+where descrip ilike 'stc Discount Add-on%'
+),
+
+
+cbs_waiver_cte as (
+    select invoice_detail_id
+    from bdl_finance.be_soa_bangl_history_subset
+    where  (descrip ilike '%waiver%'
+    or descrip ILIKE 'Plan change - Advance MRC Discount'
+or product_name ilike '%Termination%waiver%'
+	        or product_name ilike '%contract%waiver%'	
+           )
+    )
+	,
+    
+cbs_rental_cte as (
+select invoice_detail_id
+from bdl_finance.be_soa_bangl_history_subset
+where descrip ilike '%Rental%'
+),
+
+cbs_Device_promo as 
+(
+select invoice_detail_id from bdl_finance.be_soa_bangl_history
+where item_name in ( 'Fee Deduction') 
+and product_name ilike '%Free Device Promo%'
+AND net_amount < 0
+and bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+and iban in (select Iban from bdl_finance.be_soa_bangl_history_subset)
+),
+
+ cbs_promo_disc as 
+(
+select invoice_detail_id from bdl_finance.be_soa_bangl_history
+where item_name in ( 'Penalty Charges') 
+and product_name ilike '%stc Promocode Discount%'
+AND net_amount < 0
+and bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+and iban in (select Iban from bdl_finance.be_soa_bangl_history_subset)
+),
+
+cbs_to_exclude01 AS 
+(
+    select invoice_detail_id from cbs_child_cte
+    union
+    select invoice_detail_id from cbs_employee_cte
+    union 
+    select invoice_detail_id from cbs_charged_bussiness
+    union
+    select invoice_detail_id from addon_cbs_cte
+    union
+    select invoice_detail_id from cbs_waiver_cte
+    union
+    select invoice_detail_id from community_cbs_cte
+    union 
+    select invoice_detail_id from cbs_rental_cte 
+    union
+    select invoice_detail_id from cbs_Device_promo
+    union
+    select invoice_detail_id from cbs_promo_disc
+),
+
+cbs_to_reconcile as (
+select b.* from bdl_finance.be_soa_bangl_history_subset b
+left join cbs_to_exclude01 c
+on b.invoice_detail_id=c.invoice_detail_id
+where c.invoice_detail_id is null
+),
+
+
+crm_exclusion as (
+with overall_cycle_1 as(
+WITH latest_bill_cycles_col AS (
+SELECT
+  REPLACE(
+    CASE
+      WHEN day(current_date()) < 10 THEN
+        CAST(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)) AS STRING)
+      WHEN day(current_date()) < 20 THEN
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 9) AS STRING)
+      ELSE
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 19) AS STRING)
+    END, '-', ''
+  ) AS cycle_1),
+
+crm_child_Plan AS 
+(
+    select *
+    from bdl_finance.be_temp_base2_subset c
+    where (name ilike '%Shared Child%Plan%' or name ilike 'Business Shared SIM Promotion Discount' )
+    
+),
+
+crm_employee_disc as
+(
+SELECT * 
+FROM bdl_finance.be_temp_base2_subset c
+    where name ilike '%Employee%'
+    
+
+)
+,
+--Business_lines_CTE
+
+CRM_Business_lines as(
+select *from bdl_finance.be_temp_base2_subset 
+    where name ilike 'stc Business One Extension'
+    
+),
+
+crm_addon_disc as(
+        select *
+        from bdl_finance.be_temp_base2_subset
+    where name ilike 'stc Discount Add%on%'
+    
+),
+
+crm_rental as(
+select * from bdl_finance.be_temp_base2_subset
+    where (name ilike '%rental%disc%' or name ilike 'Postpaid HE1 Plan 24 Months MRC Discount')
+    
+),
+
+crm_community as(
+select * from bdl_finance.be_temp_base2_subset
+    where name ilike '%Community%'
+    
+),
+
+crm_waiver as(
+select * from 
+bdl_finance.be_temp_base2_subset
+    where (name ilike '%waiver%'
+            or name ilike '%Plan change - Advance MRC Discount%'
+            or name ILIKE '%Termination%waiver%' )
+    
+    ),
+crm_device_promo as
+(
+select * from 
+bdl_finance.be_temp_base2_subset 
+    where  name ilike '%Free Device Promo%'
+    
+),
+crm_promo_disc as 
+(
+select integration_id from bdl_finance.be_temp_base2_subset
+ where name ILIKE '%stc Promocode Discount%'
+ ),
+
+
+crms_to_exclude01 AS 
+(
+    select integration_id from crm_child_Plan
+    union
+    select integration_id from crm_employee_disc
+    union
+    select integration_id from CRM_Business_lines
+    union 
+    select integration_id from crm_rental
+    union
+    select integration_id from crm_waiver
+    union
+    select integration_id from crm_addon_disc
+    union
+    select integration_id from crm_community
+	union
+	select integration_id from crm_device_promo
+    union
+    select integration_id from crm_promo_disc
+)
+
+select * from crms_to_exclude01
+)
+
+
+
+------------------------------------------------------------------------------------------
+
+
+select * from overall_cycle_1
+
+),
+----------------------------------------------------------------------------
+crm_reconciliation as
+(WITH latest_bill_cycles_col AS (
+SELECT
+  REPLACE(
+    CASE
+      WHEN day(current_date()) < 10 THEN
+        CAST(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)) AS STRING)
+      WHEN day(current_date()) < 20 THEN
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 9) AS STRING)
+      ELSE
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 19) AS STRING)
+    END, '-', ''
+  ) AS cycle_1),
+/*WITH latest_bill_cycles_col AS (
+select
+    '20250301' as cycle_1
+    ,
+    -- Include 10th of current month if today is >= 10, otherwise 10th of previous month
+    '20250210' as cycle_2
+    ,
+    -- Include 20th of current month if today is >= 20, otherwise 20th of previous month
+    '20250220' as cycle_3
+    ),*/
+crm_to_reconcile01 as
+	(select b.* from bdl_finance.be_temp_base2_subset b
+left join crm_exclusion c
+on b.integration_id=c.integration_id
+where c.integration_id is null
+and b.name not in ('Cash on Delivery Payment')
+and name not ilike 'Business Fiber Broadband BD5 NRC Discount Add-on'
+--and b.discount is not null
+and b.name not in ('stc Business Shared Child Num')
+and b.name not in ('CBS_stc Shared Child DIS Offer')
+and b.name not in ('stc Prepaid MNP SIM')
+and b.ban not in (select pro_iban from adv_pro_bans )
+and b.ban not in (select iban from first_active_bans)
+)
+
+select * from crm_to_reconcile01
+
+)
+,
+
+ remain_recon_cte_norm as(
+with NRC_cte as
+(select * from bdl_finance.be_temp_base2_subset  c
+ where CAST(TO_DATE(c.created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+and c.name ilike 'Business Fiber Broadband BD5 NRC Discount Add-on'
+) ,
+ctesub1 as(
+select *, cast(to_date(end_dt) as date format 'yyyy-mm-dd')  as upd_end_date,
+    cast (cycle_1 AS DATE FORMAT 'yyyymmdd') as bill_cycle from (
+SELECT 
+    ban,
+    name,
+    created,
+    discount,
+	integration_id,
+	l.cycle_1,
+    CASE 
+        WHEN (name ILIKE '%1 month%' OR name ILIKE '%one month%') THEN ADD_MONTHS(created, 1)
+        WHEN (name ILIKE '%2 month%' OR name ILIKE '%two month%') THEN ADD_MONTHS(created, 2)
+        WHEN (name ILIKE '%3 month%' OR name ILIKE '%three month%') THEN ADD_MONTHS(created, 3)
+        WHEN (name ILIKE '%4 month%' OR name ILIKE '%four month%') THEN ADD_MONTHS(created, 4)
+        WHEN (name ILIKE '%5 month%' OR name ILIKE '%five month%') THEN ADD_MONTHS(created, 5)
+        WHEN (name ILIKE '%6 month%' OR name ILIKE '%six month%') THEN ADD_MONTHS(created, 6)
+        WHEN (name ILIKE '%12 month%' OR name ILIKE '%twelve month%') THEN ADD_MONTHS(created, 12)
+        WHEN (name ILIKE '%24 month%' OR name ILIKE '%twenty four month%') THEN ADD_MONTHS(created, 24)
+        ELSE end_dt
+    END AS end_dt
+FROM 
+    crm_reconciliation
+	left join latest_bill_cycles_col l
+	on
+cast(to_date(end_dt) as date format 'yyyy-mm-dd') > cast (l.cycle_1 AS DATE FORMAT 'yyyymmdd') OR end_dt IS NULL  
+WHERE 
+    name ILIKE '%month%'
+    and name not ilike '%monthly%'
+    )a
+
+),
+
+ctesub2 as
+(
+select * from ctesub1
+where  upd_end_date>bill_cycle
+),
+cte2 as
+(
+SELECT 
+    a.iban, 
+    a.billed_date,
+    net_amount_total, 
+    total_discount,
+    CASE 
+        WHEN net_amount_total = total_discount THEN 'Matched'
+        WHEN ban IS NULL THEN 'CRM data not available'
+        ELSE 'Unmatched'
+    END AS reconciled
+FROM 
+    (SELECT 
+        a.iban, 
+        a.billed_date, 
+        SUM(net_amount) AS net_amount_total 
+     FROM cbs_to_reconcile a
+     GROUP BY a.iban, a.billed_date) a
+INNER JOIN 
+    (SELECT 
+        ban, 
+        SUM(ROUND(discount, 3)) AS total_discount 
+     FROM ctesub2 
+     where integration_id not in (select integration_id from NRC_cte)
+     and name not ilike 'Business Fiber Broadband BD5 NRC Discount Add-on'
+     GROUP BY ban) b
+ON a.iban = b.ban
+),
+cte1 as
+(SELECT a.iban,a.billed_date,a.invoice_detail_id,
+       a.net_amount AS net_disc,
+       ROUND(b.discount, 3) AS discount1,
+       CASE
+           WHEN a.net_amount = ROUND(b.discount, 3) THEN 'Matched'
+           --WHEN b.ban IS NULL THEN 'CRM data not available'
+		   ELSE 'Unmatched'
+       END AS reconciled
+FROM cbs_to_reconcile a
+inner JOIN ctesub2 b
+    ON a.iban = b.ban
+) ,
+cte3 as
+(
+       SELECT a.iban, a.billed_date, net_amount_total, total_discount,
+case     WHEN  net_amount_total = total_discount THEN 'Matched'
+            WHEN ban IS NULL THEN 'CRM data not available'
+            else 'Unmatched'
+        END AS reconciled
+FROM 
+    (SELECT a.iban, a.billed_date, SUM(ROUND(net_amount, 3)) AS net_amount_total 
+     FROM cbs_to_reconcile a
+  where a.invoice_detail_id NOT IN (SELECT invoice_detail_id FROM cte1)
+     GROUP BY iban, billed_date) a
+LEFT JOIN 
+    (SELECT ban, SUM(ROUND(discount, 3)) AS total_discount 
+     FROM crm_reconciliation 
+     WHERE integration_id NOT IN (SELECT integration_id FROM ctesub1)
+     and integration_id NOT IN ( select integration_id from NRC_cte)
+    and name not ilike 'Business Fiber Broadband BD5 NRC Discount Add-on'
+     GROUP BY ban) b
+ON a.iban = b.ban
+)
+
+    SELECT * FROM cte2
+    UNION ALL 
+    SELECT * FROM cte3
+
+),
+
+
+Overall_recon_cte as(
+Select 
+      'Remain_recon_disc' as ctgy,
+      re.iban as iban,
+      --'20241210' as bill_cycle,
+      cast( re.total_discount as decimal(38,3)) as expected_disc,
+      cast(re.net_amount_total as decimal(38,3)) as discnt,
+      re.reconciled,
+        re.billed_date
+FROM remain_recon_cte_norm re
+)
+
+SELECT * from Overall_recon_cte;
+----------------------------------------------------
+
+Drop table if exists bdl_finance.be_complete_discount_adv_norm1;
+Create table bdl_finance.be_complete_discount_adv_norm1 as
+(select * from bdl_finance.be_complete_discount_adv_norm1halfother
+union 
+select * from bdl_finance.be_complete_discount_adv_norm1half);
+-------------------------------------------------------------
+
+Drop Table if exists bdl_finance.be_normal_information_halfother;
+Create Table bdl_finance.be_normal_information_halfother as 
+WITH latest_bill_cycles_col AS (
+SELECT
+  REPLACE(
+    CASE
+      WHEN day(current_date()) < 10 THEN
+        CAST(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)) AS STRING)
+      WHEN day(current_date()) < 20 THEN
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 9) AS STRING)
+      ELSE
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 19) AS STRING)
+    END, '-', ''
+  ) AS cycle_1
+  ),
+  crm_data_promocode as
+(
+select * from bdl_finance.be_temp_base2_subset  c
+ where CAST(TO_DATE(created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+ and c.name ILIKE '%stc Promocode Discount%'
+),
+cbs_data_promo as
+(
+select * from bdl_finance.be_soa_bangl_history
+where item_name in ( 'Penalty Charges') 
+and product_name ilike '%stc Promocode Discount%'
+AND net_amount < 0
+and bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+--and iban not in (select iban from first_active_bans)
+),
+promo_integ as 
+
+(
+select b.* 
+from cbs_data_promo a
+left join crm_data_promocode b
+on a.iban=b.ban
+),
+crm_data_device_promo as
+(
+select * from bdl_finance.be_temp_base2_subset  c
+ where CAST(TO_DATE(created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+ and c.name ILIKE '%Free Device Promo%'
+),
+cbs_data_device_promo as 
+(
+select * from bdl_finance.be_soa_bangl_history
+where item_name in ( 'Fee Deduction') 
+and product_name ilike '%Free Device Promo%'
+AND net_amount < 0
+and bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+--and iban not in (select iban from first_active_bans)
+
+),
+device_integ as ( 
+select b.*
+from cbs_data_device_promo a 
+left join crm_data_device_promo b
+on a.iban=b.ban
+),
+ Community_disc_CTE_norm as
+(with offer_prop as
+(
+select 
+prop.owner_register_customer_id as reg_cust_id,
+sinst.owner_entity_id_of_subscription,
+--offering_subscription_instance_id as offer_subs_inst_id,
+        MAX(CASE WHEN property_code = 'CN_OFFER_DESC' THEN property_value ELSE NULL END) AS Offer_Desc,
+        MAX(CASE WHEN property_code = 'CN_DISCOUNT_VALUE' THEN property_value ELSE NULL END) AS Disc_Value,
+        MAX(CASE WHEN property_code = 'CN_DISCOUNT_TYPE' THEN property_value ELSE NULL END) AS Discount_type,
+        MAX(CASE WHEN property_code = 'CN_CRM_PARTCODE' then property_value ELSE NULL end) as CRM_Part_code
+--row_number() over(partition by offering_subscription_instance_id, property_code Order by creation_time desc) as rn
+from bdl_raw.cbs_BC_OFFERING_PROP prop
+left join
+bdl_raw.cbs_bc_offering_inst sinst
+      on 
+      prop.offering_subscription_instance_id = sinst.offering_subscription_instance_id
+where property_code in ('CN_DISCOUNT_TYPE', 'CN_OFFER_DESC', 'CN_DISCOUNT_VALUE', 'CN_CRM_PARTCODE')
+and prop.offering_id = 1000108
+--and property_code is not NULL
+group by 1,2
+),
+
+offer_disc as (
+select 
+sub.billingaccountnumber ban,
+cast(offer.disc_value as double) as disc_value
+from offer_prop as offer
+left join 
+bdl_raw.cbs_bc_subscriber subs
+on offer.owner_entity_id_of_subscription = subs.subscriber_id
+left join
+bdl_dm.dimsubs sub
+on
+sub.subscriberid = subs.third_party_subscriber_key
+where offer.Disc_Value is not null
+),
+
+charged as (
+Select * from bdl_finance.be_soa_bangl_history_subset
+where product_id='1000108'
+),
+
+discount as (
+Select * from bdl_finance.be_soa_bangl_history bangl            ---------------------zero output in case og history1 table
+inner join bdl_raw.cbs_pm_offering_baseinfo prod
+on cast(bangl.product_id as BIGINT) = prod.offering_id
+where  prod.primary_offering_flag = 'P'
+and bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+),
+
+charged_disc as (
+select charged.iban,charged.invoice_detail_id, charged.net_amount as discount, discount.billed_date,discount.net_amount 
+from
+charged
+inner join
+discount
+on charged.iban = discount.iban
+where charged.net_amount <> 0)
+
+
+
+select b.ban, b.source,chd.invoice_detail_id, b.san, b.created, b.end_dt, round(((chd.net_amount*ofd.disc_value)/100)*-1,2) as discount, b.net_pri, b.extd_qty, b.name, b.integration_id, b.orig_order_id, b.created_by, b.status_cd, b.action_cd, b.prod_id, b.status_chg_dt, b.serial_num, b.activation_date, b.last_updated, b.x_department, b.x_channel, b.activating_agent, b.activating_agent_deparmtent, b.billingaccountnumber, b.customer_ident, b.customeraccountnumber, b.customername, b.billingaccountname, b.nationality, b.customertype, b.occupation, b.line_ctgy, b.customersegment, b.desc_text, b.cycle_1
+from charged_disc as chd 
+left join
+offer_disc as ofd
+on
+ofd.ban = chd.iban
+left join 
+bdl_finance.be_temp_base2_subset  b
+on b.ban=chd.iban
+where name ilike '%Community%'),
+Waiver_CTE_normal AS (
+ with term_waiver_ct10 as (
+select * from bdl_finance.be_temp_base2_subset  c
+ where CAST(TO_DATE(created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+ and (c.name ILIKE '%Termination%waiver%' or c.name ilike '%Connection%Fee%Waiver%' or c.name ilike 'stc Device Contract Termination Agent Waiver')
+ 
+ 
+ ),
+ term_waiver_cbs as (
+ select * from bdl_finance.be_soa_bangl_history_subset b
+where (b.descrip ilike '%Termination%waiver%' or b.descrip ilike '%Connection%Fee%Waiver%' or b.descrip ilike 'stc Device Contract Termination Agent Waiver'
+or( b.item_name in ( 'Penalty Charges','Fee Deduction') and b.product_name ilike '%Termination%waiver%')
+	or( b.item_name in ( 'Penalty Charges','Fee Deduction') and b.product_name ilike '%contract%waiver%'))
+ ),
+ 
+
+CTE10 as( 
+select  c.*
+    from term_waiver_cbs as b
+    left join  term_waiver_ct10 c
+    on b.iban = c.ban
+ 
+ )
+
+  ,
+ crm_data_ct20 as
+ (
+ select * from bdl_finance.be_temp_base2_subset c
+ where (c.name ILIKE '%Plan%waiver%' or c.name ilike 'Plan change - Advance MRC Discount' ) 
+ AND CAST(TO_DATE(created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+        and nvl(c.integration_id, '0') not in (select nvl(integration_id, '1') from CTE10 )
+        ) ,
+CTE20 as
+(
+SELECT 
+    b.ban, b.source, b.san, b.created, b.end_dt,ROUND(
+        ((DATEDIFF(
+            created,
+            ADD_MONTHS(
+                CAST(CONCAT(SUBSTR(a.bill_cycle, 1, 4), '-', SUBSTR(a.bill_cycle, 5, 2), '-', SUBSTR(a.bill_cycle, 7, 2)) AS DATE),
+                1
+            )
+        ) * b.discount) / 
+        DATEDIFF(
+            CAST(CONCAT(SUBSTR(a.bill_cycle, 1, 4), '-', SUBSTR(a.bill_cycle, 5, 2), '-', SUBSTR(a.bill_cycle, 7, 2)) AS DATE),
+            ADD_MONTHS(
+                CAST(CONCAT(SUBSTR(a.bill_cycle, 1, 4), '-', SUBSTR(a.bill_cycle, 5, 2), '-', SUBSTR(a.bill_cycle, 7, 2)) AS DATE),
+                1
+            )
+        )), 3) AS discount, b.net_pri, b.extd_qty, b.name, b.integration_id, b.orig_order_id, b.created_by, b.status_cd, b.action_cd, b.prod_id, b.status_chg_dt, b.serial_num, b.activation_date, b.last_updated, b.x_department, b.x_channel, b.activating_agent, b.activating_agent_deparmtent, b.billingaccountnumber, b.customer_ident, b.customeraccountnumber, b.customername, b.billingaccountname, b.nationality, b.customertype, b.occupation, b.line_ctgy, b.customersegment, b.desc_text, b.cycle_1
+FROM bdl_finance.be_soa_bangl_history_subset a
+left join crm_data_ct20 b
+on a.iban = b.ban
+WHERE a.invoice_detail_id not in (select invoice_detail_id from  term_waiver_cbs)
+    AND (a.descrip ILIKE 'Plan change - Advance MRC Discount' OR a.descrip ILIKE 'Plan change waiver' OR a.descrip ILIKE '%Plan Change MRC Waiver%')
+   -- and iban='1-10098045860'
+)
+
+
+,
+
+waiver_exclusion_crm as
+(
+    select integration_id from bdl_finance.be_temp_base2_subset  
+    where (name ILIKE '%Termination%waiver%' 
+            or name ilike '%Connection%Fee%Waiver%' 
+            or name ILIKE '%Plan%waiver%' 
+            or name ilike 'Plan change - Advance MRC Discount' 
+            or name  ILIKE '%month %waiver'
+			or name ilike 'stc Device Contract Termination Agent Waiver')
+),
+
+waiver_exclusion_cbs as
+(
+    select invoice_detail_id from bdl_finance.be_soa_bangl_history_subset a 
+    where (a.descrip ILIKE 'Plan change - Advance MRC Discount' 
+            OR a.descrip ILIKE 'Plan change waiver' 
+            OR a.descrip ILIKE '%Plan Change MRC Waiver%' 
+            or a.descrip ilike '%Termination%waiver%' 
+            or a.descrip ilike '%Connection%Fee%Waiver%'
+			or a.descrip ilike 'stc Device Contract Termination Agent Waiver'
+			or a.product_name ilike '%Termination%waiver%'
+	        or a.product_name ilike '%contract%waiver%')
+
+),
+
+ crm_data30 as(
+  select * from bdl_finance.be_temp_base2_subset c
+ where cast(to_date(created) as date format 'yyyy-mm-dd') <  ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE),
+            1
+        )
+and c.name ILIKE '%waiver%' 
+and (c.name not ILIKE '%Plan%waiver%' or c.name not ilike 'Plan change - Advance MRC Discount' or c.name not ILIKE '%Termination%waiver%' or c.name not ilike '%Connection%Fees%Waiver%') 
+and nvl(c.integration_id, '0') not in (select nvl(integration_id, '1')  from waiver_exclusion_crm)
+),
+
+cbs_data30 as 
+(
+select * from bdl_finance.be_soa_bangl_history_subset b
+    where b.descrip ILIKE '%waiver%'
+    and b.invoice_detail_id not in (select invoice_detail_id from  waiver_exclusion_cbs)
+	and b.invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+   -- and b.iban='1-10098045860'
+
+
+
+ ),
+ CTE30 AS (
+    SELECT c.*
+FROM cbs_data30 b
+LEFT JOIN crm_data30 c ON b.iban = c.ban
+)
+  
+   select * from CTE10
+   union 
+   select * from CTE20
+   union 
+   select * from CTE30
+
+),
+  Shared_child_cte as (
+  with crm_child_agg AS (
+    SELECT *
+    FROM bdl_finance.be_temp_base2_subset
+    WHERE (name ILIKE 'stc Business Shared Child Promo Plan Discount')
+  ),
+  cbs_child_data as
+  (
+  select * from bdl_finance.be_soa_bangl_history_subset b
+  where (b.descrip ILIKE '%Shared Child Dis%' or b.descrip ilike 'Business Shared SIM Promotion Discount')
+  and b.invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+  ),
+sc_1 as (  SELECT c.*
+    FROM cbs_child_data b
+    inner JOIN crm_child_agg c ON b.iban = c.ban),
+    sc2_cte as(
+ WITH  crm_child_agg AS (
+    SELECT b.ban, b.source, b.san, b.created, b.end_dt, b.discount * -1 AS discount, b.net_pri, b.extd_qty, b.name, b.integration_id, b.orig_order_id, b.created_by, b.status_cd, b.action_cd, b.prod_id, b.status_chg_dt, b.serial_num, b.activation_date, b.last_updated, b.x_department, b.x_channel, b.activating_agent, b.activating_agent_deparmtent, b.billingaccountnumber, b.customer_ident, b.customeraccountnumber, b.customername, b.billingaccountname, b.nationality, b.customertype, b.occupation, b.line_ctgy, b.customersegment, b.desc_text, b.cycle_1
+    FROM bdl_finance.be_temp_base2_subset b
+    WHERE (name ILIKE '%Shared Child%Plan%' or name ilike 'Business Shared SIM Promotion Discount')
+	and name not ilike 'stc Business Shared Child Promo Plan Discount'
+  ),
+  cbs_child_data as
+  (
+  select * from bdl_finance.be_soa_bangl_history_subset b
+  where (b.descrip ILIKE '%Shared Child Dis%' or b.descrip ilike 'Business Shared SIM Promotion Discount')
+  and b.invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+  ),
+  Cycle1 AS (
+    SELECT c.*
+    FROM cbs_child_data b
+    Left JOIN crm_child_agg c ON b.iban = c.ban
+    where b.iban not in (select ban from sc_1)
+  )
+  
+  SELECT * FROM Cycle1
+   )
+   select * from sc_1
+   union
+   select * from sc2_cte
+   ),
+Addon_disc_CTE_norm as
+(with   crm_addon_disc as(
+        select *
+        from bdl_finance.be_temp_base2_subset c
+        where name ilike 'stc Discount Add%on%'
+   --   AND (c.end_dt IS NULL OR cast(to_date(c.end_dt) as date format 'yyyy-mm-dd')> l.cycle_1_date)
+),
+ 
+
+ 
+addon_cbs as
+(
+select 
+*
+from bdl_finance.be_soa_bangl_history_subset as b
+where descrip ilike 'stc Discount Add-on%'
+and b.invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+)
+ 
+ 
+select crm.*
+from addon_cbs as cbs 
+left join crm_addon_disc  as crm
+on
+crm.ban = cbs.iban
+
+),
+
+ rental_disc_norm as
+(
+with crm_rental as(
+select * from bdl_finance.be_temp_base2_subset 
+where (name ilike '%rental%disc%' or name ilike 'Postpaid HE1 Plan 24 Months MRC Discount')
+--AND (c.end_dt IS NULL OR cast(to_date(c.end_dt) as date format 'yyyy-mm-dd')>l.cycle_1_date)
+),
+
+
+cbs_rental as (
+select * from bdl_finance.be_soa_bangl_history_subset as b
+where b.descrip ilike '%rental%'
+and b.invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+
+)
+
+
+select crm.*
+from cbs_rental cbs 
+left join
+crm_rental as crm
+on
+crm.ban = cbs.iban
+--where crm.ban is not null
+
+
+),
+
+bussiness_lines_cte as 
+    (
+    WITH  disc_lines AS (
+    SELECT prop.owner_register_customer_id AS reg_cust_id, sinst.owner_entity_id_of_subscription,
+           MAX(CASE WHEN property_code = 'CN_DISCOUNT_LINES' THEN property_value ELSE NULL END) AS Disc_lines
+    FROM bdl_raw.cbs_BC_OFFERING_PROP prop
+    LEFT JOIN bdl_raw.cbs_bc_offering_inst sinst ON prop.offering_subscription_instance_id = sinst.offering_subscription_instance_id
+    WHERE property_code = 'CN_DISCOUNT_LINES'
+    AND prop.offering_id = 1000106
+    GROUP BY 1, 2
+  ),
+  cbs_ext AS (
+    SELECT acct.account_code AS ban, dsclin.*
+    FROM disc_lines AS dsclin
+    LEFT JOIN bdl_raw.cbs_bc_acct acct ON dsclin.owner_entity_id_of_subscription = acct.account_id
+    AND acct.account_code IS NOT NULL
+  ) ,
+  ext_crm_cbs AS ( 
+    SELECT base.*, ext.Disc_lines
+    FROM bdl_finance.be_temp_base2_subset base
+    INNER JOIN cbs_ext ext ON base.ban = ext.ban
+WHERE name = 'stc Business One Extension'
+--and base.discount>0
+),
+  cnt_ext AS (
+    SELECT ban, Disc_lines, discount, COUNT(*) AS cnt
+    FROM ext_crm_cbs
+    WHERE TRIM(name) = 'stc Business One Extension'
+    AND discount IS NOT NULL
+    GROUP BY 1, 2, 3
+  ),
+  disc_line_calculated AS (
+    SELECT DISTINCT a.Ban, cnt.discount, a.disc_lines, cnt.cnt AS total_lines
+    FROM (
+      SELECT ban, discount, Disc_lines
+      FROM ext_crm_cbs
+      WHERE name = 'stc Business One Extension'
+      GROUP BY 1, 2, 3
+    ) a
+    LEFT JOIN cnt_ext AS cnt ON a.ban = cnt.ban
+  ),
+  calc_disc AS (
+    SELECT ban, SUM(NODL * discount) * -1 AS disc_calc
+    FROM (
+      SELECT *,
+             CASE
+               WHEN CAST(disc_lines AS INT) >= rsum THEN total_lines
+               ELSE (
+                 CASE
+                   WHEN CAST(disc_lines AS INT) - rsum_lag >= 0 THEN CAST(disc_lines AS INT) - rsum_lag
+                   ELSE 0
+                 END
+               )
+             END AS NODL
+      FROM (
+        SELECT *,
+               NVL(LAG(rsum) OVER (PARTITION BY ban ORDER BY discount), 0) AS rsum_lag
+        FROM (
+          SELECT *,
+                 SUM(total_lines) OVER (PARTITION BY ban ORDER BY discount) AS rsum
+          FROM disc_line_calculated
+        ) a
+      ) b
+    ) c
+    GROUP BY 1
+  ),
+  cbs_charged AS (
+    SELECT *
+    from bdl_finance.be_soa_bangl_history_subset
+    where descrip ilike 'stc Business DIS Extension Offer'
+	and invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+  )
+  SELECT b.ban, b.source, b.san, b.created, b.end_dt,cd.disc_calc AS discount, b.net_pri, b.extd_qty, b.name, b.integration_id, b.orig_order_id, b.created_by, b.status_cd, b.action_cd, b.prod_id, b.status_chg_dt, b.serial_num, b.activation_date, b.last_updated, b.x_department, b.x_channel, b.activating_agent, b.activating_agent_deparmtent, b.billingaccountnumber, b.customer_ident, b.customeraccountnumber, b.customername, b.billingaccountname, b.nationality, b.customertype, b.occupation, b.line_ctgy, b.customersegment, b.desc_text, b.cycle_1
+   FROM cbs_charged AS cc
+  left JOIN calc_disc AS cd ON cd.ban = cc.iban
+  left join (select * from bdl_finance.be_temp_base2_subset
+where name ilike 'CBS_stc Business DIS Extension Offer') b on b.ban=cc.iban
+    ),
+Employee_discount_CTE as (
+with Employee_discount_CTE1 AS (
+with cbs_billing AS (
+    SELECT iban, bill_cycle,billed_date, descrip, item_name, product_name, net_amount AS net_amount
+    FROM bdl_finance.be_soa_bangl_history_subset
+    where descrip ILIKE '%employee%group%'
+	and invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+
+  )
+ ,
+ cbs_billing_1 as
+  (WITH employee_leaving AS (
+  SELECT *
+  FROM bdl_finance.be_soa_bangl_history_subset
+  WHERE descrip ILIKE 'Employee Leaving Billing Discount'
+  and invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+) ,
+previous_cycle AS (  
+  SELECT 
+  iban,
+  CONCAT(
+    CAST(YEAR(add_months(from_unixtime(unix_timestamp(bill_cycle, 'yyyyMMdd')), -1)) AS STRING),
+    LPAD(CAST(MONTH(add_months(from_unixtime(unix_timestamp(bill_cycle, 'yyyyMMdd')), -1)) AS STRING), 2, '0'),
+    LPAD(CAST(DAY(add_months(from_unixtime(unix_timestamp(bill_cycle, 'yyyyMMdd')), -1)) AS STRING), 2, '0')
+  ) AS bill_cycle
+FROM employee_leaving
+)
+SELECT s.iban, s.bill_cycle, s.billed_date, s.descrip, s.item_name, s.product_name, s.net_amount,CAST(TRIM(regexp_extract(s.descrip, '\\d+', 0)) AS INT) AS max_emp_disc
+FROM bdl_finance.be_soa_bangl_history s
+JOIN previous_cycle p 
+  ON s.iban = p.iban 
+  AND s.bill_cycle = p.bill_cycle
+WHERE s.item_name IN ('Monthly Fee', 'Billing Discount')
+  AND s.net_amount < 0
+ 
+  )
+  ,
+
+ cbs_emp_iban_pkg as
+ (with cbs_emp_iban_pkg1 AS (
+    SELECT iban, descrip, billed_date,agg_disc, NVL(max_emp_disc, 0) AS max_emp_disc
+    FROM (
+      SELECT iban, descrip,billed_date, SUM(net_amount) AS agg_disc,
+             CAST(TRIM(regexp_extract(descrip, '\\d+', 0)) AS INT) AS max_emp_disc
+      FROM cbs_billing
+      WHERE descrip ILIKE '%employee%group%'
+     -- AND descrip ILIKE '%BD%'
+     --and iban in ('1-11315381132','1-6751033734')
+      GROUP BY 1, 2,3
+    ) a
+  ) ,
+  cbs_emp_iban_pkg2 AS (
+   SELECT a.iban, a.descrip, a.billed_date,a.net_amount as agg_disc,b.max_emp_disc
+   from bdl_finance.be_soa_bangl_history_subset a
+   inner join cbs_billing_1 b
+   on a.iban=b.iban
+   where a.bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+   and a.descrip ilike 'Employee Leaving Billing Discount'
+  )
+/* select * from cbs_emp_iban_pkg1
+ union */
+ select * from cbs_emp_iban_pkg2 )
+,
+  employee_bans AS (
+    SELECT ban.OU_NUM AS parent_ban
+    FROM bdl_raw.CRM_S_ORG_EXT ban
+    LEFT JOIN bdl_raw.CRM_S_ORG_EXT_X banx ON ban.ROW_ID = banx.PAR_ROW_ID
+    WHERE banx.ATTRIB_06 = 'Employee'
+  ),
+  employee_appld_disc AS (
+    SELECT cbs.iban, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM employee_bans pb 
+    inner JOIN cbs_emp_iban_pkg cbs ON pb.parent_ban = cbs.iban
+    --where cbs.iban in ('1-11315381132','1-6751033734')
+  ),
+  child_appld_disc AS (
+    SELECT ban.OU_NUM AS PARENT_BAN, cb.ATTRIB_34 AS CHILD_BAN, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM bdl_raw.crm_S_ORG_EXT ban
+    JOIN bdl_raw.CRM_S_ORG_EXT_XM cb ON cb.PAR_ROW_ID = ban.ROW_ID
+    Inner JOIN cbs_emp_iban_pkg cbs ON cbs.iban = cb.ATTRIB_34
+    where  cb.TYPE = 'EMPLOYEE'
+    --and cbs.iban='1-6751033734'
+    --AND cb.ATTRIB_01 IN ('Active')
+    AND cbs.iban IS NOT NULL
+  )
+   ,
+  child_disc_agg AS ( 
+    SELECT PARENT_BAN,billed_date, SUM(agg_disc) AS agg_disc
+    FROM child_appld_disc
+    GROUP BY 1,2
+  ),
+  recon AS (
+    SELECT iban, max_emp_disc, disc1,
+           CASE WHEN max_emp_disc = 0 THEN 'Matched'
+                WHEN disc1 <= max_emp_disc THEN 'Matched'
+                ELSE 'Unmatched' END AS recon
+    FROM (
+      SELECT p.iban, CAST(p.max_emp_disc AS DOUBLE) AS max_emp_disc,
+             (CAST(p.agg_disc + NVL(c.agg_disc, 0) AS DOUBLE) * -1) AS disc1,
+             ROW_NUMBER() OVER (PARTITION BY p.iban ORDER BY p.max_emp_disc DESC) AS top1
+      FROM employee_appld_disc AS p
+      LEFT JOIN child_disc_agg AS c ON p.iban = c.PARENT_BAN
+    ) a
+    WHERE top1 = 1
+  )
+  SELECT --'Parent' AS Ctgy,
+         emp.iban, descrip, billed_date,/*recon.disc1*/emp.agg_disc AS discnt, emp.max_emp_disc AS expected_disc, recon.recon as reconciled
+  FROM employee_appld_disc emp
+  INNER JOIN recon ON emp.iban = recon.iban
+  UNION
+  SELECT -- 'Child' AS Ctgy,
+         CHILD_BAN, descrip,billed_date,
+         /*recon.disc1*/NVL(child.agg_disc, 0) AS discnt, 
+         child.max_emp_disc AS expected_disc, recon.recon AS reconciled
+  FROM child_appld_disc child
+  INNER JOIN recon ON child.PARENT_BAN = recon.iban
+  ),
+  
+
+Employee_discount_CTE2 as (
+
+with cbs_billing AS ( 
+    SELECT iban, bill_cycle,billed_date, descrip, item_name, product_name, net_amount AS net_amount
+    FROM bdl_finance.be_soa_bangl_history_subset
+    where descrip ILIKE '%employee%group%'
+	and invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+  )
+ ,
+
+ cbs_emp_iban_pkg as
+ ( SELECT iban, descrip, billed_date,agg_disc, NVL(max_emp_disc, 0) AS max_emp_disc
+    FROM (
+      SELECT iban, descrip,billed_date, SUM(net_amount) AS agg_disc,
+             CAST(TRIM(regexp_extract(descrip, '\\d+', 0)) AS INT) AS max_emp_disc
+      FROM cbs_billing
+      WHERE descrip ILIKE '%employee%group%'
+     -- AND descrip ILIKE '%BD%'
+     --and iban in ('1-11315381132','1-6751033734')
+      GROUP BY 1, 2,3
+    ) a
+)
+,
+  employee_bans AS (
+    SELECT ban.OU_NUM AS parent_ban
+    FROM bdl_raw.CRM_S_ORG_EXT ban
+    LEFT JOIN bdl_raw.CRM_S_ORG_EXT_X banx ON ban.ROW_ID = banx.PAR_ROW_ID
+    WHERE banx.ATTRIB_06 = 'Employee'
+  ) ,
+  employee_appld_disc AS ( 
+    SELECT cbs.iban, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM employee_bans pb 
+    inner JOIN cbs_emp_iban_pkg cbs ON pb.parent_ban = cbs.iban
+    --where cbs.iban in ('1-11315381132','1-6751033734')
+  ),
+  child_appld_disc AS (
+    SELECT ban.OU_NUM AS PARENT_BAN, cb.ATTRIB_34 AS CHILD_BAN, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM bdl_raw.crm_S_ORG_EXT ban
+    JOIN bdl_raw.CRM_S_ORG_EXT_XM cb ON cb.PAR_ROW_ID = ban.ROW_ID
+    inner JOIN cbs_emp_iban_pkg cbs ON cbs.iban = cb.ATTRIB_34
+    where  cb.TYPE = 'EMPLOYEE'
+    --and cbs.iban='1-6751033734'
+    --AND cb.ATTRIB_01 IN ('Active')
+    AND cbs.iban IS NOT NULL
+  )
+   ,
+  child_disc_agg AS ( 
+    SELECT PARENT_BAN as iban,billed_date, SUM(agg_disc) AS disc1,max_emp_disc
+    FROM child_appld_disc
+    GROUP BY 1,2,4
+  ),
+  recon AS (
+    SELECT iban, max_emp_disc, disc1,
+           CASE WHEN max_emp_disc = 0 THEN 'Matched'
+                WHEN disc1 <= max_emp_disc THEN 'Matched'
+                ELSE 'Unmatched' END AS recon
+    FROM child_disc_agg
+    )
+    
+
+  SELECT -- 'Child' AS Ctgy,
+         CHILD_BAN, descrip,billed_date,
+         /*recon.disc1*/NVL(child.agg_disc, 0) AS discnt,
+         child.max_emp_disc AS expected_disc, recon.recon AS reconciled
+  FROM child_appld_disc child
+  INNER JOIN recon ON child.PARENT_BAN = recon.iban),
+  
+  Employee_discount_CTE3 as  
+(with  cbs_billing as 
+(
+SELECT iban, bill_cycle,billed_date, descrip, item_name, product_name, net_amount AS net_amount
+    FROM bdl_finance.be_soa_bangl_history_subset
+    where descrip ILIKE '%employee%group%'
+    and iban not in (select child_ban from employee_discount_cte2)
+	and invoice_detail_id not in (select invoice_detail_id from Community_disc_CTE_norm)
+)
+
+
+,
+
+
+cbs_emp_iban_pkg as
+ ( SELECT iban, descrip, billed_date,agg_disc, NVL(max_emp_disc, 0) AS max_emp_disc
+    FROM (
+      SELECT iban, descrip,billed_date, SUM(net_amount) AS agg_disc,
+             CAST(TRIM(regexp_extract(descrip, '\\d+', 0)) AS INT) AS max_emp_disc
+      FROM cbs_billing
+      WHERE descrip ILIKE '%employee%group%'
+     -- AND descrip ILIKE '%BD%'
+     --and iban in ('1-11315381132','1-6751033734')
+      GROUP BY 1, 2,3
+    ) a
+),
+
+employee_bans as(
+SELECT ban.OU_NUM AS parent_ban
+    FROM bdl_raw.CRM_S_ORG_EXT ban
+    LEFT JOIN bdl_raw.CRM_S_ORG_EXT_X banx ON ban.ROW_ID = banx.PAR_ROW_ID
+    WHERE banx.ATTRIB_06 = 'Employee'
+),
+
+
+employee_appld_disc as
+(
+SELECT cbs.iban, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM employee_bans pb 
+    inner JOIN cbs_emp_iban_pkg cbs ON pb.parent_ban = cbs.iban
+),
+
+ child_appld_disc AS (
+    SELECT ban.OU_NUM AS PARENT_BAN, cb.ATTRIB_34 AS CHILD_BAN, cbs.descrip,cbs.billed_date, cbs.agg_disc, cbs.max_emp_disc
+    FROM bdl_raw.crm_S_ORG_EXT ban
+    JOIN bdl_raw.CRM_S_ORG_EXT_XM cb ON cb.PAR_ROW_ID = ban.ROW_ID
+    LEFT JOIN cbs_emp_iban_pkg cbs ON cbs.iban = cb.ATTRIB_34
+    where  cb.TYPE = 'EMPLOYEE'
+    --and cbs.iban='1-6751033734'
+    --AND cb.ATTRIB_01 IN ('Active')
+    AND cbs.iban IS NOT NULL
+  )
+   ,
+  child_disc_agg AS ( 
+     SELECT PARENT_BAN,billed_date, SUM(agg_disc) AS agg_disc
+    FROM child_appld_disc
+    GROUP BY 1,2
+  ),
+
+
+  recon AS (
+
+   SELECT iban, max_emp_disc, disc1,
+           CASE WHEN max_emp_disc = 0 THEN 'Matched'
+                WHEN disc1 <= max_emp_disc THEN 'Matched'
+                ELSE 'Unmatched' END AS recon
+    FROM (
+      SELECT p.iban, CAST(p.max_emp_disc AS DOUBLE) AS max_emp_disc,
+             (CAST(p.agg_disc + NVL(c.agg_disc, 0) AS DOUBLE) * -1) AS disc1,
+             ROW_NUMBER() OVER (PARTITION BY p.iban ORDER BY p.max_emp_disc DESC) AS top1
+      FROM employee_appld_disc AS p
+      LEFT JOIN child_disc_agg AS c ON p.iban = c.PARENT_BAN
+    ) a
+    WHERE top1 = 1
+  )
+
+
+
+
+
+SELECT --'Parent' AS Ctgy,
+         emp.iban, descrip, billed_date,/*recon.disc1*/emp.agg_disc AS discnt, emp.max_emp_disc AS expected_disc, recon.recon as reconciled
+  FROM employee_appld_disc emp
+  INNER JOIN recon ON emp.iban = recon.iban
+  UNION
+  SELECT -- 'Child' AS Ctgy,
+         CHILD_BAN, descrip,billed_date,
+         /*recon.disc1*/NVL(child.agg_disc, 0) AS discnt, 
+         child.max_emp_disc AS expected_disc, recon.recon AS reconciled
+  FROM child_appld_disc child
+  INNER JOIN recon ON child.PARENT_BAN = recon.iban
+
+)
+
+  select a.iban AS ban, NULL AS source, NULL AS san, NULL AS created, NULL AS end_dt,case when reconciled = 'Matched' then discnt
+else expected_disc *-1 end AS discount, NULL AS net_pri, NULL AS extd_qty, NULL AS name, NULL AS integration_id, NULL AS orig_order_id, NULL AS created_by, NULL AS status_cd, NULL AS action_cd, NULL AS prod_id, NULL AS status_chg_dt, NULL AS serial_num, NULL AS activation_date, NULL AS last_updated, NULL AS x_department, NULL AS x_channel, NULL AS activating_agent, NULL AS activating_agent_deparmtent, NULL AS billingaccountnumber, NULL AS customer_ident, NULL AS customeraccountnumber, NULL AS customername, NULL AS billingaccountname, NULL AS nationality, NULL AS customertype, NULL AS occupation, NULL AS line_ctgy, NULL AS customersegment, NULL AS desc_text,
+CONCAT(
+    CAST(YEAR(ADD_MONTHS(a.billed_date, -1)) AS STRING),
+    LPAD(CAST(MONTH(ADD_MONTHS(a.billed_date, -1)) AS STRING), 2, '0'),
+    LPAD(CAST(DAY(ADD_MONTHS(a.billed_date, -1)) AS STRING), 2, '0')
+) AS  cycle_1
+ from Employee_discount_CTE1 a
+  union
+  select b.child_ban AS ban, NULL AS source, NULL AS san, NULL AS created, NULL AS end_dt,case when reconciled = 'Matched' then discnt
+else expected_disc *-1 end AS discount, NULL AS net_pri, NULL AS extd_qty, NULL AS name, NULL AS integration_id, NULL AS orig_order_id, NULL AS created_by, NULL AS status_cd, NULL AS action_cd, NULL AS prod_id, NULL AS status_chg_dt, NULL AS serial_num, NULL AS activation_date, NULL AS last_updated, NULL AS x_department, NULL AS x_channel, NULL AS activating_agent, NULL AS activating_agent_deparmtent, NULL AS billingaccountnumber, NULL AS customer_ident, NULL AS customeraccountnumber, NULL AS customername, NULL AS billingaccountname, NULL AS nationality, NULL AS customertype, NULL AS occupation, NULL AS line_ctgy, NULL AS customersegment, NULL AS desc_text,
+CONCAT(
+    CAST(YEAR(ADD_MONTHS(b.billed_date, -1)) AS STRING),
+    LPAD(CAST(MONTH(ADD_MONTHS(b.billed_date, -1)) AS STRING), 2, '0'),
+    LPAD(CAST(DAY(ADD_MONTHS(b.billed_date, -1)) AS STRING), 2, '0')
+) AS  cycle_1
+ from Employee_discount_CTE2 b
+  union
+  select c.iban AS ban, NULL AS source, NULL AS san, NULL AS created, NULL AS end_dt,case when reconciled = 'Matched' then discnt
+else expected_disc *-1 end AS discount, NULL AS net_pri, NULL AS extd_qty, NULL AS name, NULL AS integration_id, NULL AS orig_order_id, NULL AS created_by, NULL AS status_cd, NULL AS action_cd, NULL AS prod_id, NULL AS status_chg_dt, NULL AS serial_num, NULL AS activation_date, NULL AS last_updated, NULL AS x_department, NULL AS x_channel, NULL AS activating_agent, NULL AS activating_agent_deparmtent, NULL AS billingaccountnumber, NULL AS customer_ident, NULL AS customeraccountnumber, NULL AS customername, NULL AS billingaccountname, NULL AS nationality, NULL AS customertype, NULL AS occupation, NULL AS line_ctgy, NULL AS customersegment, NULL AS desc_text,
+CONCAT(
+    CAST(YEAR(ADD_MONTHS(c.billed_date, -1)) AS STRING),
+    LPAD(CAST(MONTH(ADD_MONTHS(c.billed_date, -1)) AS STRING), 2, '0'),
+    LPAD(CAST(DAY(ADD_MONTHS(c.billed_date, -1)) AS STRING), 2, '0')
+) AS  cycle_1
+ from Employee_discount_CTE3 c
+),
+
+total_discount as (
+select 'promo_disc' as ctgy,* from promo_integ
+union
+select 'device promo' as ctgy,* from device_integ
+union 
+select 'waiver_disc' as ctgy,* from Waiver_CTE_normal
+union
+select 'Shared Child' as ctgy,* from Shared_child_cte
+union
+select 'community_disc' as ctgy,ban, source, san, created, end_dt,discount, net_pri, extd_qty, name, integration_id, orig_order_id, created_by, status_cd, action_cd, prod_id, status_chg_dt, serial_num, activation_date, last_updated, x_department, x_channel, activating_agent, activating_agent_deparmtent, billingaccountnumber, customer_ident, customeraccountnumber, customername, billingaccountname, nationality, customertype, occupation, line_ctgy, customersegment, desc_text, cycle_1
+ from Community_disc_CTE_norm
+union
+select 'Employee disc' as ctgy,* from Employee_discount_CTE
+union
+select 'business_disc' as ctgy,* from bussiness_lines_cte
+union
+select 'addon_disc' as ctgy,* from Addon_disc_CTE_norm
+union
+select 'rental_disc' as ctgy,* from rental_disc_norm
+
+)
+
+select * from total_discount;
+
+
+--------------------------------------------------------------------------------------------------------------
+Drop Table if exists bdl_finance.be_normal_information_other;
+Create Table bdl_finance.be_normal_information_other as 
+with remain_recon as 
+(WITH latest_bill_cycles_col AS (
+SELECT
+  REPLACE(
+    CASE
+      WHEN day(current_date()) < 10 THEN
+        CAST(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)) AS STRING)
+      WHEN day(current_date()) < 20 THEN
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 9) AS STRING)
+      ELSE
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 19) AS STRING)
+    END, '-', ''
+  ) AS cycle_1
+  ),
+
+
+BillCycle_PMRC as(
+	     select    bill_cycle_type,
+	     expected_disc,
+			effective_time,
+		    billed_date ,
+		    invoice_id,
+		    invoice_detail_id,
+		    account_id,
+		    iban,
+		    bill_cycle,
+            descrip,
+		    item_name,
+		    created,
+			end_dt,
+		    product_name,
+            NVL(net_amount,0) AS net_amount,
+		    load_date,
+			rnk 
+			from (
+			SELECT
+			bc.bill_cycle_type,
+			bc.effective_time,
+			b.discount as expected_disc,
+			b.created,
+			b.end_dt,
+		    bangl.billed_date ,
+		    bangl.invoice_id,
+		    bangl.invoice_detail_id,
+		    bangl.account_id,
+		    bangl.iban,
+		    bangl.bill_cycle,
+            bangl.descrip,
+		    bangl.item_name,
+		    bangl.product_name,
+            bangl.net_amount,
+		    bangl.load_date,
+			DENSE_RANK() OVER (PARTITION BY bc.account_id ORDER BY bc.expiration_time DESC) AS rnk
+		from bdl_finance.be_soa_bangl_history AS bangl
+		left JOIN 
+			bdl_raw.cbs_bc_acct_bill_cycle AS bc 
+			ON bangl.account_id = bc.account_id
+			inner join bdl_finance.be_history_record b
+			on b.ban=bangl.iban
+		
+		WHERE bangl.net_amount<0
+		and (name ILIKE '%Shared Child Plan%' or name ilike '%waiver%' or name ILIKE '%month%' or name ilike 'stc Business One Extension' )
+		and (descrip ILIKE '%Shared Child Dis%'or descrip ILIKE 'Plan change - Advance MRC Discount' or descrip ILIKE 'Plan change waiver' or descrip ILIKE '%waiver%' or descrip ilike '%	stc Business DIS Extension Offer%')
+		and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+
+		and bc.bill_cycle_type in ('1','10','20')
+		AND 
+		    bc.effective_time < (cast(trunc(add_months(now(), - 0), 'MONTH') AS DATE))
+		AND
+            bc.expiration_time > NOW()
+        AND bill_cycle in (select * from  latest_bill_cycles_col)
+            )a
+            ),
+CRM_PMRC_billcycle_1 as
+(
+      select    bill_cycle_type,
+			effective_time,
+			expected_disc,
+		    billed_date ,
+		    invoice_id,
+		    invoice_detail_id,
+		    account_id,
+		    iban,
+		    bill_cycle,
+            descrip,
+            created,
+			end_dt,
+		    item_name,
+		    product_name,
+            NVL(net_amount,0) AS net_amount,
+		    load_date,
+        Dense_rank() OVER (PARTITION BY iban ORDER BY bill_cycle DESC) AS rnk
+    FROM 
+        BillCycle_PMRC
+),
+CRM_PMRC_billcycle_2 as
+(
+    SELECT * FROM CRM_PMRC_billcycle_1
+    WHERE rnk=1
+)
+
+,
+CRM_PMRC_billcycle_3 as
+(
+    SELECT * FROM CRM_PMRC_billcycle_1
+    WHERE rnk=2
+),
+BillCycle_ids AS 
+(
+    SELECT * FROM BillCycle_PMRC
+    WHERE 
+    bill_cycle_type in ('1','10','20') 
+    AND 
+    rnk = 1
+),
+All_PMRC_billcyc as
+(
+select a.iban,
+a.billed_date,
+a.bill_cycle,
+b.bill_cycle_type,
+CASE 
+WHEN b.bill_cycle_type = '1'
+THEN  ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 0) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+--
+WHEN b.bill_cycle_type = '10' AND DAY(CURRENT_DATE()) <= 10 
+THEN ROUND((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -2), 'MONTH'), 9) AS DATE), 
+       CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE))) + 0)
+/ (DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+
+WHEN b.bill_cycle_type = '10' AND DAY(CURRENT_DATE()) > 10 
+THEN ROUND((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 9) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE))) + 0)
+/ (DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+--
+WHEN b.bill_cycle_type ='20' AND DAY(CURRENT_DATE()) <= 20 
+THEN ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -2), 'MONTH'), 19) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+
+WHEN b.bill_cycle_type ='20' AND DAY(CURRENT_DATE()) > 20 
+THEN ROUND(((ABS(DATEDIFF(
+        CAST(DATE_ADD(TRUNC(ADD_MONTHS(NOW(), -1), 'MONTH'), 19) AS DATE), 
+        CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(a.bill_cycle, 'yyyyMMdd'), 'yyyy-MM-dd') AS DATE)))) +0) 
+/(DAY(LAST_DAY(Add_Months(NOW(), -1)))) * a.expected_disc, 3)
+END AS expected_disc,
+a.net_amount,
+a.invoice_id,
+a.invoice_detail_id,
+a.account_id,
+a.descrip,
+a.item_name,
+a.product_name,
+a.load_date,
+a.created,
+a.end_dt
+FROM 
+    CRM_PMRC_billcycle_3 a
+INNER JOIN
+     BillCycle_ids b
+ON
+    a.iban=b.iban
+),
+adv_pro_bans as
+(SELECT 
+    distinct a.bill_cycle as pro_bill_cycle,a.iban as pro_iban--,net_amount as discnt,expected_disc,
+    /*case when net_amount=expected_disc then 'Matched'
+    else 'Unmatched' end as reconciled*/--created,end_dt,bill_cycle,expected_disc,net_amount,invoice_id,invoice_detail_id, account_id,descrip,item_name,product_name,load_date,bill_cycle_type
+FROM 
+    All_PMRC_billcyc a
+   left join latest_bill_cycles_col cyc 
+on
+cast(to_date(end_dt) as date format 'yyyy-mm-dd') > cast (cyc.cycle_1 AS DATE FORMAT 'yyyymmdd')
+OR end_dt IS NULL  
+     where cast(to_date(created) as date format 'yyyy-mm-dd') <  ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(cyc.cycle_1, 1, 4), '-', SUBSTR(cyc.cycle_1, 5, 2), '-', SUBSTR(cyc.cycle_1, 7, 2)) AS DATE),
+            1
+        )
+    ),
+    
+    
+	
+first_active_bans as
+(
+select distinct soa.iban from bdl_finance.be_soa_bangl_history soa
+inner join
+(select iban,bill_cycle,lag(bill_cycle) over (partition by iban order by billed_date) as lag_cycle from
+        (select distinct iban,bill_cycle,billed_date from bdl_finance.be_soa_bangl_history)a
+	)b 
+	on soa.iban = b.iban and soa.bill_cycle = b.bill_cycle
+	where b.lag_cycle is NULL
+	and soa.bill_cycle = (select cycle_1 from latest_bill_cycles_col)
+    and  ( 
+item_name IN ('Monthly Fee', 'Billing Discount')
+    or (
+        item_name in ('Fee Deduction', 'Penalty Charges') and ( descrip ilike '%Waiver%' or descrip ilike '%disc%' or descrip ilike '%Fees Refund%')
+    )
+	or( item_name in ( 'Fee Deduction','Penalty Charges') and product_name ilike '%Free Device Promo%')
+    or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%stc Promocode Discount%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%Termination%waiver%')
+	or( item_name in ( 'Penalty Charges','Fee Deduction') and product_name ilike '%contract%waiver%')
+)
+    and net_amount < 0
+),
+
+cbs_child_cte as
+(select invoice_detail_id 
+from bdl_finance.be_soa_bangl_history_subset
+where (descrip ilike '%child%' or descrip ilike 'Business Shared SIM Promotion Discount')
+),
+
+cbs_employee_cte as 
+(
+select 
+invoice_detail_id
+from bdl_finance.be_soa_bangl_history_subset
+where  descrip ilike '%employee%'
+),
+
+cbs_charged_bussiness as (
+Select 
+   invoice_detail_id
+    from bdl_finance.be_soa_bangl_history_subset
+    where descrip ilike 'stc Business DIS Extension Offer'
+),
+
+community_cbs_cte as
+(select invoice_detail_id from bdl_finance.be_soa_bangl_history_subset
+where product_id='1000108')
+,
+addon_cbs_cte as
+(
+select 
+invoice_detail_id
+from bdl_finance.be_soa_bangl_history_subset
+where descrip ilike 'stc Discount Add-on%'
+),
+
+
+cbs_waiver_cte as (
+    select invoice_detail_id
+    from bdl_finance.be_soa_bangl_history_subset
+    where  (descrip ilike '%waiver%'
+    or descrip ILIKE 'Plan change - Advance MRC Discount'
+or product_name ilike '%Termination%waiver%'
+	        or product_name ilike '%contract%waiver%'	
+           )
+    )
+	,
+    
+cbs_rental_cte as (
+select invoice_detail_id
+from bdl_finance.be_soa_bangl_history_subset
+where descrip ilike '%Rental%'
+),
+
+cbs_Device_promo as 
+(
+select invoice_detail_id from bdl_finance.be_soa_bangl_history
+where item_name in ( 'Fee Deduction') 
+and product_name ilike '%Free Device Promo%'
+AND net_amount < 0
+and bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+and iban in (select Iban from bdl_finance.be_soa_bangl_history_subset)
+),
+
+ cbs_promo_disc as 
+(
+select invoice_detail_id from bdl_finance.be_soa_bangl_history
+where item_name in ( 'Penalty Charges') 
+and product_name ilike '%stc Promocode Discount%'
+AND net_amount < 0
+and bill_cycle in (select cycle_1 from latest_bill_cycles_col)
+and iban in (select Iban from bdl_finance.be_soa_bangl_history_subset)
+),
+
+cbs_to_exclude01 AS 
+(
+    select invoice_detail_id from cbs_child_cte
+    union
+    select invoice_detail_id from cbs_employee_cte
+    union 
+    select invoice_detail_id from cbs_charged_bussiness
+    union
+    select invoice_detail_id from addon_cbs_cte
+    union
+    select invoice_detail_id from cbs_waiver_cte
+    union
+    select invoice_detail_id from community_cbs_cte
+    union 
+    select invoice_detail_id from cbs_rental_cte 
+    union
+    select invoice_detail_id from cbs_Device_promo
+    union
+    select invoice_detail_id from cbs_promo_disc
+),
+
+cbs_to_reconcile as (
+select b.* from bdl_finance.be_soa_bangl_history_subset b
+left join cbs_to_exclude01 c
+on b.invoice_detail_id=c.invoice_detail_id
+where c.invoice_detail_id is null
+),
+
+
+crm_exclusion as (
+with overall_cycle_1 as(
+WITH latest_bill_cycles_col AS (
+SELECT
+  REPLACE(
+    CASE
+      WHEN day(current_date()) < 10 THEN
+        CAST(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)) AS STRING)
+      WHEN day(current_date()) < 20 THEN
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 9) AS STRING)
+      ELSE
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 19) AS STRING)
+    END, '-', ''
+  ) AS cycle_1
+  ),
+crm_child_Plan AS 
+(
+    select *
+    from bdl_finance.be_temp_base2_subset c
+    where (name ilike '%Shared Child%Plan%' or name ilike 'Business Shared SIM Promotion Discount' )
+    
+),
+
+crm_employee_disc as
+(
+SELECT * 
+FROM bdl_finance.be_temp_base2_subset c
+    where name ilike '%Employee%'
+    
+
+)
+,
+--Business_lines_CTE
+
+CRM_Business_lines as(
+select *from bdl_finance.be_temp_base2_subset 
+    where name ilike 'stc Business One Extension'
+    
+),
+
+crm_addon_disc as(
+        select *
+        from bdl_finance.be_temp_base2_subset
+    where name ilike 'stc Discount Add%on%'
+    
+),
+
+crm_rental as(
+select * from bdl_finance.be_temp_base2_subset
+    where (name ilike '%rental%disc%' or name ilike 'Postpaid HE1 Plan 24 Months MRC Discount')
+    
+),
+
+crm_community as(
+select * from bdl_finance.be_temp_base2_subset
+    where name ilike '%Community%'
+    
+),
+
+crm_waiver as(
+select * from 
+bdl_finance.be_temp_base2_subset
+    where (name ilike '%waiver%'
+            or name ilike '%Plan change - Advance MRC Discount%'
+            or name ILIKE '%Termination%waiver%' )
+    
+    ),
+crm_device_promo as
+(
+select * from 
+bdl_finance.be_temp_base2_subset 
+    where  name ilike '%Free Device Promo%'
+    
+),
+crm_promo_disc as 
+(
+select integration_id from bdl_finance.be_temp_base2_subset
+ where name ILIKE '%stc Promocode Discount%'
+ ),
+
+
+crms_to_exclude01 AS 
+(
+    select integration_id from crm_child_Plan
+    union
+    select integration_id from crm_employee_disc
+    union
+    select integration_id from CRM_Business_lines
+    union 
+    select integration_id from crm_rental
+    union
+    select integration_id from crm_waiver
+    union
+    select integration_id from crm_addon_disc
+    union
+    select integration_id from crm_community
+	union
+	select integration_id from crm_device_promo
+    union
+    select integration_id from crm_promo_disc
+)
+
+select * from crms_to_exclude01
+)
+
+
+
+------------------------------------------------------------------------------------------
+
+
+select * from overall_cycle_1
+
+),
+----------------------------------------------------------------------------
+crm_reconciliation as
+(WITH latest_bill_cycles_col AS (
+SELECT
+  REPLACE(
+    CASE
+      WHEN day(current_date()) < 10 THEN
+        CAST(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)) AS STRING)
+      WHEN day(current_date()) < 20 THEN
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 9) AS STRING)
+      ELSE
+        CAST(DATE_ADD(DATE_TRUNC('MONTH', ADD_MONTHS(current_date(), -1)), 19) AS STRING)
+    END, '-', ''
+  ) AS cycle_1
+  ),
+crm_to_reconcile01 as
+	(select b.* from bdl_finance.be_temp_base2_subset b
+left join crm_exclusion c
+on b.integration_id=c.integration_id
+where c.integration_id is null
+and b.name not in ('Cash on Delivery Payment')
+and name not ilike 'Business Fiber Broadband BD5 NRC Discount Add-on'
+--and b.discount is not null
+and b.name not in ('stc Business Shared Child Num')
+and b.name not in ('CBS_stc Shared Child DIS Offer')
+and b.name not in ('stc Prepaid MNP SIM')
+and b.ban not in (select pro_iban from adv_pro_bans )
+and b.ban not in (select iban from first_active_bans)
+)
+
+select * from crm_to_reconcile01
+
+)
+,
+
+ --remain_recon_cte_norm as(
+--with
+
+NRC_cte as
+(select * from bdl_finance.be_temp_base2_subset  c
+ where CAST(TO_DATE(c.created) AS DATE) BETWEEN 
+        CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE)
+        AND ADD_MONTHS(
+            CAST(CONCAT(SUBSTR(c.cycle_1, 1, 4), '-', SUBSTR(c.cycle_1, 5, 2), '-', SUBSTR(c.cycle_1, 7, 2)) AS DATE), 
+            1
+        )
+and c.name ilike 'Business Fiber Broadband BD5 NRC Discount Add-on'
+)
+
+ ,
+ctesub1 as(
+select b.ban, b.source, b.san, b.created, b.discount, b.net_pri, b.extd_qty, b.name, b.integration_id, b.orig_order_id, b.created_by, b.status_cd, b.action_cd, b.prod_id, b.status_chg_dt, b.serial_num, b.activation_date, b.last_updated, b.x_department, b.x_channel, b.activating_agent, b.activating_agent_deparmtent, b.billingaccountnumber, b.customer_ident, b.customeraccountnumber, b.customername, b.billingaccountname, b.nationality, b.customertype, b.occupation, b.line_ctgy, b.customersegment, b.desc_text, b.cycle_1
+, cast(to_date(b.end_dt) as date format 'yyyy-mm-dd')  as end_dt
+from (
+
+SELECT 
+    b.ban, b.source, b.san, b.created, b.discount, b.net_pri, b.extd_qty, b.name, b.integration_id, b.orig_order_id, b.created_by, b.status_cd, b.action_cd, b.prod_id, b.status_chg_dt, b.serial_num, b.activation_date, b.last_updated, b.x_department, b.x_channel, b.activating_agent, b.activating_agent_deparmtent, b.billingaccountnumber, b.customer_ident, b.customeraccountnumber, b.customername, b.billingaccountname, b.nationality, b.customertype, b.occupation, b.line_ctgy, b.customersegment, b.desc_text, b.cycle_1
+,case 
+        WHEN (name ILIKE '%1 month%' OR name ILIKE '%one month%') THEN ADD_MONTHS(created, 1)
+        WHEN (name ILIKE '%2 month%' OR name ILIKE '%two month%') THEN ADD_MONTHS(created, 2)
+        WHEN (name ILIKE '%3 month%' OR name ILIKE '%three month%') THEN ADD_MONTHS(created, 3)
+        WHEN (name ILIKE '%4 month%' OR name ILIKE '%four month%') THEN ADD_MONTHS(created, 4)
+        WHEN (name ILIKE '%5 month%' OR name ILIKE '%five month%') THEN ADD_MONTHS(created, 5)
+        WHEN (name ILIKE '%6 month%' OR name ILIKE '%six month%') THEN ADD_MONTHS(created, 6)
+        WHEN (name ILIKE '%12 month%' OR name ILIKE '%twelve month%') THEN ADD_MONTHS(created, 12)
+        WHEN (name ILIKE '%24 month%' OR name ILIKE '%twenty four month%') THEN ADD_MONTHS(created, 24)
+        ELSE end_dt
+    END AS end_dt
+FROM 
+    crm_reconciliation b
+	left join latest_bill_cycles_col l
+	on
+cast(to_date(b.end_dt) as date format 'yyyy-mm-dd') > cast (l.cycle_1 AS DATE FORMAT 'yyyymmdd') OR end_dt IS NULL  
+WHERE 
+    name ILIKE '%month%'
+    and name not ilike '%monthly%'
+    )b
+
+),
+
+ctesub2 as
+(
+select * from ctesub1
+where  cast(to_date(end_dt) as date format 'yyyy-mm-dd') > cast (cycle_1 AS DATE FORMAT 'yyyymmdd')
+),
+cte2 as
+(
+SELECT 
+    b.ban, b.source, b.san, b.created, b.end_dt, b.discount  AS discount, b.net_pri, b.extd_qty, b.name, b.integration_id, b.orig_order_id, b.created_by, b.status_cd, b.action_cd, b.prod_id, b.status_chg_dt, b.serial_num, b.activation_date, b.last_updated, b.x_department, b.x_channel, b.activating_agent, b.activating_agent_deparmtent, b.billingaccountnumber, b.customer_ident, b.customeraccountnumber, b.customername, b.billingaccountname, b.nationality, b.customertype, b.occupation, b.line_ctgy, b.customersegment, b.desc_text, b.cycle_1
+
+FROM 
+    (SELECT 
+        * 
+     FROM cbs_to_reconcile a
+     ) a
+INNER JOIN 
+    (SELECT 
+       *
+     FROM ctesub2 
+     where integration_id not in (select integration_id from NRC_cte)
+     and name not ilike 'Business Fiber Broadband BD5 NRC Discount Add-on'
+) b
+ON a.iban = b.ban
+),
+cte1 as
+(SELECT a.iban,a.billed_date,a.invoice_detail_id,
+       a.net_amount AS net_disc,
+       ROUND(b.discount, 3) AS discount1,
+       CASE
+           WHEN a.net_amount = ROUND(b.discount, 3) THEN 'Matched'
+           --WHEN b.ban IS NULL THEN 'CRM data not available'
+       END AS reconciled
+FROM cbs_to_reconcile a
+inner JOIN ctesub2 b
+    ON a.iban = b.ban
+) ,
+cte3 as
+(
+       SELECT b.ban, b.source, b.san, b.created, b.end_dt, b.discount  AS discount, b.net_pri, b.extd_qty, b.name, b.integration_id, b.orig_order_id, b.created_by, b.status_cd, b.action_cd, b.prod_id, b.status_chg_dt, b.serial_num, b.activation_date, b.last_updated, b.x_department, b.x_channel, b.activating_agent, b.activating_agent_deparmtent, b.billingaccountnumber, b.customer_ident, b.customeraccountnumber, b.customername, b.billingaccountname, b.nationality, b.customertype, b.occupation, b.line_ctgy, b.customersegment, b.desc_text, b.cycle_1
+
+FROM 
+    (SELECT a.iban, a.billed_date, SUM(ROUND(net_amount, 3)) AS net_amount_total 
+     FROM cbs_to_reconcile a
+  where a.invoice_detail_id NOT IN (SELECT invoice_detail_id FROM cte1)
+     GROUP BY iban, billed_date) a
+LEFT JOIN 
+    (SELECT * 
+     FROM crm_reconciliation 
+     WHERE integration_id NOT IN (SELECT integration_id FROM ctesub1)
+     and integration_id NOT IN ( select integration_id from NRC_cte)
+    and name not ilike 'Business Fiber Broadband BD5 NRC Discount Add-on'
+) b
+ON a.iban = b.ban
+)
+
+    SELECT * FROM cte2
+    UNION ALL 
+    SELECT * FROM cte3)
+
+select 'remain_recon_disc' as ctgy,* from remain_recon ;
+
+drop table if exists bdl_finance.be_temp_base2_1_norm1;
+create table bdl_finance.be_temp_base2_1_norm1 as
+select * from bdl_finance.be_normal_information_halfother
+where cycle_1 is not null
+union
+select * from bdl_finance.be_normal_information_other
